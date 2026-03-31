@@ -1,0 +1,16 @@
+CSE 376 Assignment #3 (20 points)
+Spring 2026
+
+This programming assignment enriches your RHT, developed for Homework #2, by adding support for fault tolerance.
+Your applications should survive failures. That is, if you terminate a node (e.g., using CTRL-C),
+the applications should continue executing operations without experiencing interruptions.
+Also, operations executing during the failure should not block forever or return incorrect results.
+
+The failure model is crash-stop: faulty nodes will not recover and continue execution.
+
+A typical approach to guarantee non-blocking fault tolerance is consensus, and its
+well-known Paxos-Commit implementation (which is a non-blocking 2PC). You are free to explore other possibilities, but you need to justify them well.
+
+The submission should be done through coursesite.lehigh.edu and should consist of:
+- the source code of your assignment;
+- a document containing the three performance plots. One of them should pertain to a faulty execution, and two to correct execution.
