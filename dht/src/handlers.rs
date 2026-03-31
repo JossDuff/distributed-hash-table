@@ -35,7 +35,7 @@ where
     if **primary_replica == s.my_node_id {
         let db = s.db.clone();
         tokio::spawn(async move {
-            let resp = db.get(&key).await;
+            let resp = db.get(&key).await.map(|(v, _)| v);
             let _ = response_sender.send(resp);
         });
     } else {
@@ -100,7 +100,7 @@ where
         let my_node_id = s.my_node_id.clone();
         let senders = s.senders.clone();
         tokio::spawn(async move {
-            db.put(key, val).await;
+            db.put(key, val, 0).await;
             let _ = response_sender.send(true);
 
             let req = PeerMessage::ReplicaPut { pair };
@@ -221,7 +221,7 @@ pub(crate) async fn handle_local_triput<K, V>(
         let local_voted = if let Some(mut entries) = local_entries {
             entries.sort_by_key(|(_, idx)| *idx);
 
-            let mut guards: HashMap<usize, OwnedMutexGuard<HashMap<K, V>>> = HashMap::new();
+            let mut guards: HashMap<usize, OwnedMutexGuard<HashMap<K, (V, u64)>>> = HashMap::new();
             let mut lock_failed = false;
             for (pair, idx) in &entries {
                 if !guards.contains_key(idx) {
@@ -313,7 +313,7 @@ pub(crate) async fn handle_local_triput<K, V>(
                                 pair.val.clone(),
                                 tx_id
                             );
-                            guard.insert(pair.key, pair.val.clone());
+                            guard.insert(pair.key, (pair.val.clone(), 0));
                         } else {
                             warn!("stripe {} not found in guards for tx {}", stripe_idx, tx_id);
                         }
@@ -393,7 +393,7 @@ pub(crate) fn handle_peer_put<K, V>(
     tokio::spawn(async move {
         let key = pair.key;
         let val = pair.val.clone();
-        let result = db.put(key, val).await;
+        let result = db.put(key, val, 0).await;
         let resp: PeerMessage<K, V> = PeerMessage::PutResponse {
             success: result,
             req_id,
@@ -445,7 +445,7 @@ pub(crate) fn handle_peer_prepare<K, V>(
             .collect();
         entries.sort_by_key(|(_, idx)| *idx);
 
-        let mut guards: HashMap<usize, OwnedMutexGuard<HashMap<K, V>>> = HashMap::new();
+        let mut guards: HashMap<usize, OwnedMutexGuard<HashMap<K, (V, u64)>>> = HashMap::new();
         let mut lock_failed = false;
         for (_, idx) in &entries {
             if !guards.contains_key(idx) {
@@ -519,7 +519,7 @@ where
         if let Some(mut tx) = pending.remove(&tx_id) {
             for (pair, stripe_idx) in &tx.pairs {
                 if let Some(guard) = tx.guards.get_mut(stripe_idx) {
-                    guard.insert(pair.key, pair.val.clone());
+                    guard.insert(pair.key, (pair.val.clone(), 0));
                 }
             }
 

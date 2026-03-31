@@ -56,7 +56,7 @@ impl fmt::Display for NodeId {
 
 pub(crate) struct PendingTx<K: Clone, V: Clone> {
     pub(crate) pairs: Vec<(KVPair<K, V>, usize)>, // (pair, stripe_index)
-    pub(crate) guards: HashMap<usize, OwnedMutexGuard<HashMap<K, V>>>,
+    pub(crate) guards: HashMap<usize, OwnedMutexGuard<HashMap<K, (V, u64)>>>,
 }
 
 // Shared state accessible by both tasks: local message handler and peer message handler
@@ -301,7 +301,7 @@ where
                 let db = s.db.clone();
                 let senders = s.senders.clone();
                 tokio::spawn(async move {
-                    let result = db.get(&key).await;
+                    let result = db.get(&key).await.map(|(v, _)| v);
                     let resp: PeerMessage<K, V> = PeerMessage::GetResponse {
                         val: result,
                         req_id,
@@ -321,7 +321,7 @@ where
             PeerMessage::ReplicaPut { pair } => {
                 let db = s.db.clone();
                 tokio::spawn(async move {
-                    db.put(pair.key, pair.val).await;
+                    db.put(pair.key, pair.val, 0).await;
                 });
             }
 
