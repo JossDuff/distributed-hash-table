@@ -31,52 +31,36 @@ where
     V: Clone,
     K: Clone,
 {
-    // asking a primary replica for a get
-    Get {
-        key: K,
-        req_id: u64,
-    },
-    // primary replica responding to a get request
-    GetResponse {
+    // === Quorum Read Protocol ===
+    // Coordinator asks a replica to read a key
+    QuorumGet { key: K, req_id: u64 },
+    // Replica responds with its local value + version
+    QuorumGetResponse {
         val: Option<V>,
+        version: u64,
         req_id: u64,
     },
-    // asking a primary replica for a put
-    Put {
-        pair: KVPair<K, V>,
-        req_id: u64,
-    },
-    // primary replica responding to a put request
-    PutResponse {
-        success: bool,
-        req_id: u64,
-    },
-    // message from a primary replica to process a put
-    ReplicaPut {
-        pair: KVPair<K, V>,
-    },
-    // 2PC messages:
-    // Coordinator asking primary replicas to ready for a PUT
+
+    // === Paxos-Commit Write Protocol ===
+    // Coordinator asks a replica to prepare for writing (acquire stripe locks)
     Prepare {
         pairs: Vec<KVPair<K, V>>,
         tx_id: u64,
+        version: u64,
     },
-    // Primary replica responding to coordinator saying they're ready to commit
-    VotePrepared {
-        tx_id: u64,
-    },
-    // Primary replica responding to coordinator saying they can't acquire locks
-    VoteAbort {
-        tx_id: u64,
-    },
-    // After coordinator has heard back from all nodes, broadcast to all primary replicas
-    // Primary replicas either commit or abort the PUT
-    Commit {
-        tx_id: u64,
-    },
-    Abort {
-        tx_id: u64,
-    },
+    // Replica votes yes (locks acquired, ready to commit)
+    VotePrepared { tx_id: u64 },
+    // Replica votes no (cannot acquire locks)
+    VoteAbort { tx_id: u64 },
+    // Coordinator tells replicas to commit (quorum achieved)
+    Commit { tx_id: u64 },
+    // Coordinator tells replicas to abort
+    Abort { tx_id: u64 },
+
+    // === Crash Detection ===
+    Ping,
+    Pong,
+
     // This node has finished its tests
     Done,
 }

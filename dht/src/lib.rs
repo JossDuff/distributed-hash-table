@@ -10,23 +10,23 @@ pub use config::Config;
 use db::StripedDb;
 use handlers::{
     handle_local_get, handle_local_put, handle_local_triput, handle_peer_commit,
-    handle_peer_prepare, handle_peer_put,
+    handle_peer_prepare,
 };
 pub use messages::{LocalMessage, PeerMessage};
 use net::{connect_all, Peers};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
     fmt::{self, Debug},
     hash::{Hash, Hasher},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::OwnedMutexGuard;
-use tokio::sync::{mpsc, oneshot, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{debug, error, info, warn};
 
 const CHANNEL_BUFFER_SIZE: usize = 64;
@@ -57,6 +57,7 @@ impl fmt::Display for NodeId {
 pub(crate) struct PendingTx<K: Clone, V: Clone> {
     pub(crate) pairs: Vec<(KVPair<K, V>, usize)>, // (pair, stripe_index)
     pub(crate) guards: HashMap<usize, OwnedMutexGuard<HashMap<K, (V, u64)>>>,
+    pub(crate) version: u64,
 }
 
 // Shared state accessible by both tasks: local message handler and peer message handler
@@ -66,10 +67,16 @@ pub(crate) struct Shared<K: Clone, V: Clone> {
     pub(crate) my_node_id: NodeId,
     pub(crate) replication_degree: usize,
     pub(crate) db: StripedDb<K, V>,
-    pub(crate) awaiting_put_response: Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>,
-    pub(crate) awaiting_get_response: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<V>>>>>,
+    // Lamport clock for write versioning
+    pub(crate) version_counter: AtomicU64,
+    // Quorum read response collection
+    pub(crate) awaiting_quorum_get: Arc<Mutex<HashMap<u64, mpsc::Sender<(Option<V>, u64)>>>>,
+    // Paxos-Commit vote collection (votes carry sender identity for per-key quorum checking)
+    pub(crate) awaiting_votes: Arc<Mutex<HashMap<u64, mpsc::Sender<(NodeId, bool)>>>>,
     pub(crate) pending_prepares: Arc<Mutex<HashMap<u64, PendingTx<K, V>>>>,
-    pub(crate) awaiting_votes: Arc<Mutex<HashMap<u64, mpsc::Sender<bool>>>>,
+    // Crash detection
+    pub(crate) alive_nodes: Arc<Mutex<HashSet<NodeId>>>,
+    pub(crate) last_pong: Arc<Mutex<HashMap<NodeId, Instant>>>,
     pub(crate) done_count: AtomicUsize,
     // signaled when done_count reaches cluster.len()
     pub(crate) shutdown: Notify,
@@ -102,6 +109,32 @@ where
         key_replica_indices(key, self.cluster.len(), self.replication_degree)
             .into_iter()
             .map(|i| &self.cluster[i])
+            .collect()
+    }
+
+    /// Assign a new version for a write operation (Lamport clock).
+    pub(crate) fn next_version(&self) -> u64 {
+        self.version_counter.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Update local Lamport clock on receiving a remote version.
+    pub(crate) fn observe_version(&self, remote_version: u64) {
+        self.version_counter.fetch_max(remote_version, Ordering::SeqCst);
+    }
+
+    /// Quorum size for this replication degree (strict majority).
+    pub(crate) fn quorum_size(&self) -> usize {
+        self.replication_degree / 2 + 1
+    }
+
+    /// Get alive replicas for a key.
+    pub(crate) async fn get_alive_replicas(&self, key: &K) -> Vec<NodeId> {
+        let all_replicas = self.get_key_replicas(key);
+        let alive = self.alive_nodes.lock().await;
+        all_replicas
+            .into_iter()
+            .filter(|r| alive.contains(r))
+            .cloned()
             .collect()
     }
 
@@ -149,13 +182,11 @@ where
         net_handle: &tokio::runtime::Handle,
     ) -> Result<(Self, mpsc::Sender<LocalMessage<K, V>>)> {
         let db = StripedDb::new(config.stripes);
-        let awaiting_put_response: Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let awaiting_get_response: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<V>>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
         let pending_prepares: Arc<Mutex<HashMap<u64, PendingTx<K, V>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let awaiting_votes: Arc<Mutex<HashMap<u64, mpsc::Sender<bool>>>> =
+        let awaiting_votes: Arc<Mutex<HashMap<u64, mpsc::Sender<(NodeId, bool)>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let awaiting_quorum_get: Arc<Mutex<HashMap<u64, mpsc::Sender<(Option<V>, u64)>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
         // this is a barrier
@@ -170,16 +201,28 @@ where
         let peer_inbox = peers.inbox;
         let senders = peers.senders;
 
+        // Initialize alive_nodes with all cluster members
+        let alive_nodes: HashSet<NodeId> = cluster.iter().cloned().collect();
+        // Initialize last_pong timestamps for all peers
+        let now = Instant::now();
+        let last_pong: HashMap<NodeId, Instant> = cluster
+            .iter()
+            .filter(|n| **n != my_node_id)
+            .map(|n| (n.clone(), now))
+            .collect();
+
         let shared = Arc::new(Shared {
             senders,
             cluster,
             my_node_id,
             replication_degree: config.repication_degree,
             db,
-            awaiting_get_response,
-            awaiting_put_response,
-            pending_prepares,
+            version_counter: AtomicU64::new(0),
+            awaiting_quorum_get,
             awaiting_votes,
+            pending_prepares,
+            alive_nodes: Arc::new(Mutex::new(alive_nodes)),
+            last_pong: Arc::new(Mutex::new(last_pong)),
             done_count: AtomicUsize::new(0),
             shutdown: Notify::new(),
         });
@@ -296,111 +339,86 @@ where
     while let Some((from, msg)) = inbox.recv().await {
         debug!("Got {:?} from {}", msg, from);
         match msg {
-            // peer asks us for a GET (we're primary)
-            PeerMessage::Get { key, req_id } => {
+            // === Quorum Read ===
+            PeerMessage::QuorumGet { key, req_id } => {
                 let db = s.db.clone();
                 let senders = s.senders.clone();
                 tokio::spawn(async move {
-                    let result = db.get(&key).await.map(|(v, _)| v);
-                    let resp: PeerMessage<K, V> = PeerMessage::GetResponse {
-                        val: result,
-                        req_id,
+                    let (val, version) = match db.get(&key).await {
+                        Some((v, ver)) => (Some(v), ver),
+                        None => (None, 0),
                     };
+                    let resp: PeerMessage<K, V> =
+                        PeerMessage::QuorumGetResponse { val, version, req_id };
                     if let Some(sender) = senders.get(&from) {
                         let _ = sender.send(resp).await;
                     }
                 });
             }
 
-            // peer asks us for a PUT (we're primary)
-            PeerMessage::Put { pair, req_id } => {
-                handle_peer_put(&s, from, pair, req_id);
+            PeerMessage::QuorumGetResponse { val, version, req_id } => {
+                debug!("QuorumGetResponse for req {} with version {}", req_id, version);
+                let awaiting = s.awaiting_quorum_get.lock().await;
+                if let Some(tx) = awaiting.get(&req_id) {
+                    let _ = tx.send((val, version)).await;
+                } else {
+                    error!("QuorumGetResponse for unknown req_id {}", req_id);
+                }
             }
 
-            // replica put from primary
-            PeerMessage::ReplicaPut { pair } => {
-                let db = s.db.clone();
-                tokio::spawn(async move {
-                    db.put(pair.key, pair.val, 0).await;
-                });
+            // === Paxos-Commit ===
+            PeerMessage::Prepare { pairs, tx_id, version } => {
+                handle_peer_prepare(&s, from, pairs, tx_id, version);
             }
 
-            // response to our earlier GET request
-            PeerMessage::GetResponse { val, req_id } => {
-                let mut awaiting = s.awaiting_get_response.lock().await;
-                match awaiting.remove(&req_id) {
-                    Some(sender) => {
-                        if sender.send(val).is_err() {
-                            error!("Failed to deliver GetResponse for req {}", req_id);
-                        }
-                    }
-                    None => {
-                        error!("GetResponse for unknown req_id {}", req_id);
-                    }
-                };
-            }
-
-            // response to our earlier PUT request
-            PeerMessage::PutResponse { success, req_id } => {
-                let mut awaiting = s.awaiting_put_response.lock().await;
-                match awaiting.remove(&req_id) {
-                    Some(sender) => {
-                        if sender.send(success).is_err() {
-                            error!("Failed to deliver PutResponse for req {}", req_id);
-                        }
-                    }
-                    None => {
-                        error!("PutResponse for unknown req_id {}", req_id);
-                    }
-                };
-            }
-
-            // 2PC: abort from coordinator
-            PeerMessage::Abort { tx_id } => {
-                debug!("2pc abort: Received Abort from coordinator for tx_id {tx_id}, removing from pending_prepares...");
-                s.pending_prepares.lock().await.remove(&tx_id);
-                debug!("2pc abort: Successfully removed {tx_id} from pending_prepares");
-            }
-
-            // 2PC: prepare from coordinator
-            PeerMessage::Prepare { pairs, tx_id } => {
-                handle_peer_prepare(&s, from, pairs, tx_id);
-            }
-
-            // 2PC: vote responses (we're coordinator)
             PeerMessage::VotePrepared { tx_id } => {
+                debug!("VotePrepared from {} for tx {}", from, tx_id);
                 let tx = {
-                    debug!("2pc voteprepated: getting lock on awaiting_votes for {tx_id}...");
+                    debug!("VotePrepared: getting lock on awaiting_votes for tx {tx_id}...");
                     let awaiting = s.awaiting_votes.lock().await;
-                    debug!("2pc voteprepated: got lock on awaiting_votes for {tx_id}");
+                    debug!("VotePrepared: got lock on awaiting_votes for tx {tx_id}");
                     awaiting.get(&tx_id).cloned()
                 };
                 if let Some(tx) = tx {
-                    let _ = tx.send(true).await;
+                    let _ = tx.send((from, true)).await;
                 } else {
-                    warn!("2pc voteprepared: No sender for {tx_id}");
+                    warn!("VotePrepared: No sender for tx {tx_id}");
                 }
             }
             PeerMessage::VoteAbort { tx_id } => {
+                debug!("VoteAbort from {} for tx {}", from, tx_id);
                 let tx = {
-                    debug!("2pc voteabort: getting lock on awaiting_votes for {tx_id}...");
+                    debug!("VoteAbort: getting lock on awaiting_votes for tx {tx_id}...");
                     let awaiting = s.awaiting_votes.lock().await;
-                    debug!("2pc voteabort: got lock on awaiting_votes for {tx_id}");
+                    debug!("VoteAbort: got lock on awaiting_votes for tx {tx_id}");
                     awaiting.get(&tx_id).cloned()
                 };
                 if let Some(tx) = tx {
-                    let _ = tx.send(false).await;
+                    let _ = tx.send((from, false)).await;
                 } else {
-                    warn!("2pc voteabort: No sender for {tx_id}");
+                    warn!("VoteAbort: No sender for tx {tx_id}");
                 }
             }
 
-            // 2PC: commit from coordinator
             PeerMessage::Commit { tx_id } => {
                 handle_peer_commit(&s, tx_id);
             }
 
-            // peer finished their test
+            PeerMessage::Abort { tx_id } => {
+                debug!("Received Abort for tx {tx_id}, removing from pending_prepares...");
+                s.pending_prepares.lock().await.remove(&tx_id);
+                debug!("Successfully removed tx {tx_id} from pending_prepares");
+            }
+
+            // === Crash Detection ===
+            PeerMessage::Ping => {
+                let _ = s.send_to_peer(&from, PeerMessage::Pong).await;
+            }
+            PeerMessage::Pong => {
+                s.last_pong.lock().await.insert(from, Instant::now());
+            }
+
+            // === Shutdown ===
             PeerMessage::Done => {
                 info!("{} is done with their test", from);
                 s.mark_done();
