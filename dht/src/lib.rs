@@ -23,13 +23,15 @@ use std::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::sync::OwnedMutexGuard;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{debug, error, info};
 
 const CHANNEL_BUFFER_SIZE: usize = 64;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct KVPair<K, V>
@@ -267,24 +269,80 @@ where
     pub async fn run(self) -> Result<()> {
         let shared_local = self.shared.clone();
         let shared_peer = self.shared.clone();
+        let shared_heartbeat = self.shared.clone();
         let shutdown = self.shared.clone();
 
         let local_handle = tokio::spawn(run_local_loop(shared_local, self.local_inbox));
         let peer_handle = tokio::spawn(run_peer_loop(shared_peer, self.peer_inbox));
+        let heartbeat_handle = tokio::spawn(spawn_heartbeat_task(shared_heartbeat));
 
         // Wait for shutdown signal (done_count >= cluster.len())
         shutdown.shutdown.notified().await;
         info!("All peers done, shutting down");
 
-        // Cancel both loops.  We don't strictly need to abort
+        // Cancel all loops
         local_handle.abort();
         peer_handle.abort();
+        heartbeat_handle.abort();
 
         // Swallow JoinErrors from the aborts
         let _ = local_handle.await;
         let _ = peer_handle.await;
+        let _ = heartbeat_handle.await;
 
         Ok(())
+    }
+}
+
+async fn spawn_heartbeat_task<K, V>(s: Arc<Shared<K, V>>)
+where
+    K: Send
+        + Sync
+        + 'static
+        + Debug
+        + Serialize
+        + for<'de> Deserialize<'de>
+        + Hash
+        + Eq
+        + PartialEq
+        + Clone
+        + Copy,
+    V: Send + Sync + 'static + Debug + Serialize + for<'de> Deserialize<'de> + Clone,
+{
+    let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+    loop {
+        interval.tick().await;
+
+        // Send Ping to all alive peers
+        let alive: Vec<NodeId> = {
+            let alive = s.alive_nodes.lock().await;
+            alive
+                .iter()
+                .filter(|n| **n != s.my_node_id)
+                .cloned()
+                .collect()
+        };
+        for node in &alive {
+            let _ = s.send_to_peer(node, PeerMessage::Ping).await;
+        }
+
+        // Check for timed-out peers
+        let now = Instant::now();
+        let mut dead: Vec<NodeId> = Vec::new();
+        {
+            let pongs = s.last_pong.lock().await;
+            for node in &alive {
+                if let Some(last) = pongs.get(node) {
+                    if now.duration_since(*last) > HEARTBEAT_TIMEOUT {
+                        dead.push(node.clone());
+                    }
+                }
+            }
+        }
+        for node in &dead {
+            info!("Heartbeat: {} timed out, marking as dead", node);
+            s.mark_node_done(node).await;
+        }
     }
 }
 
