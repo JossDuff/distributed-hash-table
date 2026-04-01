@@ -8,10 +8,7 @@ mod net;
 use anyhow::{anyhow, Result};
 pub use config::Config;
 use db::StripedDb;
-use handlers::{
-    handle_local_get, handle_local_put, handle_local_triput,
-    handle_peer_prepare,
-};
+use handlers::{handle_local_get, handle_local_write, handle_peer_prepare};
 pub use messages::{LocalMessage, PeerMessage};
 use net::{connect_all, Peers};
 use serde::{Deserialize, Serialize};
@@ -32,6 +29,9 @@ use tracing::{debug, error, info};
 const CHANNEL_BUFFER_SIZE: usize = 64;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(500);
+pub(crate) const VOTE_LEARN_TIMEOUT: Duration = Duration::from_millis(500);
+pub(crate) const PREPARE_LOCK_TIMEOUT: Duration = Duration::from_millis(2000);
+pub(crate) const QUORUM_READ_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct KVPair<K, V>
@@ -377,14 +377,13 @@ where
                 pair,
                 response_sender,
             } => {
-                handle_local_put(&s, pair, response_sender).await?;
+                handle_local_write(&s, vec![pair], response_sender).await;
             }
-            // This node is the coordinator for the TRIPUT
             LocalMessage::TriPut {
                 pairs,
                 response_sender,
             } => {
-                handle_local_triput(&s, pairs, response_sender).await;
+                handle_local_write(&s, pairs.to_vec(), response_sender).await;
             }
             LocalMessage::Done => {
                 info!("I am done with my tests, notifying peers");
@@ -452,7 +451,7 @@ where
 
             // === Paxos-Commit ===
             PeerMessage::Prepare { pairs, tx_id, version } => {
-                handle_peer_prepare(&s, from, pairs, tx_id, version);
+                handle_peer_prepare(&s, from, pairs, tx_id, version).await;
             }
 
             // === Paxos-Commit: Acceptor Role ===
