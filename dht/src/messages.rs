@@ -1,4 +1,4 @@
-use crate::KVPair;
+use crate::{KVPair, NodeId};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use tokio::sync::oneshot;
@@ -42,20 +42,24 @@ where
     },
 
     // === Paxos-Commit Write Protocol ===
-    // Coordinator asks a replica to prepare for writing (acquire stripe locks)
+    // Coordinator asks a replica to prepare (acquire stripe locks)
     Prepare {
         pairs: Vec<KVPair<K, V>>,
         tx_id: u64,
         version: u64,
     },
-    // Replica votes yes (locks acquired, ready to commit)
-    VotePrepared { tx_id: u64 },
-    // Replica votes no (cannot acquire locks)
-    VoteAbort { tx_id: u64 },
-    // Coordinator tells replicas to commit (quorum achieved)
-    Commit { tx_id: u64 },
-    // Coordinator tells replicas to abort
-    Abort { tx_id: u64 },
+    // RM sends vote to ALL nodes (phase 2a)
+    Vote {
+        tx_id: u64,
+        rm_id: NodeId,
+        vote: bool,
+    },
+    // Acceptor confirms vote to ALL nodes (phase 2b)
+    Accepted {
+        tx_id: u64,
+        rm_id: NodeId,
+        vote: bool,
+    },
 
     // === Crash Detection ===
     Ping,

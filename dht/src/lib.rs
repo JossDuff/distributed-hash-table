@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 pub use config::Config;
 use db::StripedDb;
 use handlers::{
-    handle_local_get, handle_local_put, handle_local_triput, handle_peer_commit,
+    handle_local_get, handle_local_put, handle_local_triput,
     handle_peer_prepare,
 };
 pub use messages::{LocalMessage, PeerMessage};
@@ -23,14 +23,13 @@ use std::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 use tokio::sync::OwnedMutexGuard;
 use tokio::sync::{mpsc, Mutex, Notify};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 const CHANNEL_BUFFER_SIZE: usize = 64;
-pub(crate) const COORDINATOR_VOTE_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct KVPair<K, V>
@@ -60,6 +59,18 @@ pub(crate) struct PendingTx<K: Clone, V: Clone> {
     pub(crate) version: u64,
 }
 
+/// Tracks Accepted messages for a transaction so every participant can
+/// independently determine the commit/abort outcome (Faster Paxos-Commit).
+pub(crate) struct TxVoteTracker<K: Clone, V: Clone> {
+    // For each RM: (acceptors that confirmed Prepared, acceptors that confirmed Aborted)
+    pub(crate) rm_votes: Mutex<HashMap<NodeId, (HashSet<NodeId>, HashSet<NodeId>)>>,
+    pub(crate) all_rms: HashSet<NodeId>,
+    pub(crate) key_replicas: Vec<(K, Vec<NodeId>)>,
+    pub(crate) pairs: Vec<KVPair<K, V>>,
+    pub(crate) version: u64,
+    pub(crate) notify: Notify,
+}
+
 // Shared state accessible by both tasks: local message handler and peer message handler
 pub(crate) struct Shared<K: Clone, V: Clone> {
     pub(crate) senders: HashMap<NodeId, mpsc::Sender<PeerMessage<K, V>>>,
@@ -71,8 +82,9 @@ pub(crate) struct Shared<K: Clone, V: Clone> {
     pub(crate) version_counter: AtomicU64,
     // Quorum read response collection
     pub(crate) awaiting_quorum_get: Arc<Mutex<HashMap<u64, mpsc::Sender<(Option<V>, u64)>>>>,
-    // Paxos-Commit vote collection (votes carry sender identity for per-key quorum checking)
-    pub(crate) awaiting_votes: Arc<Mutex<HashMap<u64, mpsc::Sender<(NodeId, bool)>>>>,
+    // Paxos-Commit: acceptor log and transaction vote trackers
+    pub(crate) acceptor_log: Arc<Mutex<HashMap<(u64, NodeId), bool>>>,
+    pub(crate) tx_trackers: Arc<Mutex<HashMap<u64, Arc<TxVoteTracker<K, V>>>>>,
     pub(crate) pending_prepares: Arc<Mutex<HashMap<u64, PendingTx<K, V>>>>,
     // Crash detection
     pub(crate) alive_nodes: Arc<Mutex<HashSet<NodeId>>>,
@@ -97,12 +109,23 @@ where
         + Copy,
     V: Send + Sync + 'static + Debug + Serialize + for<'de> Deserialize<'de> + Clone,
 {
-    // Increment done_count and signal shutdown if all nodes are done.
-    pub(crate) fn mark_done(&self) {
-        let count = self.done_count.fetch_add(1, Ordering::SeqCst) + 1;
-        if count >= self.cluster.len() {
-            self.shutdown.notify_waiters();
+    /// Mark a node as done (finished tests or crashed).
+    /// Removes from alive_nodes and increments done_count.
+    /// Prevents double-counting (a node that crashes AND sends Done).
+    pub(crate) async fn mark_node_done(&self, node: &NodeId) {
+        let mut alive = self.alive_nodes.lock().await;
+        if alive.remove(node) {
+            drop(alive);
+            let count = self.done_count.fetch_add(1, Ordering::SeqCst) + 1;
+            if count >= self.cluster.len() {
+                self.shutdown.notify_waiters();
+            }
         }
+    }
+
+    /// Acceptor quorum: majority of ALL nodes in cluster.
+    pub(crate) fn acceptor_quorum(&self) -> usize {
+        self.cluster.len() / 2 + 1
     }
 
     pub(crate) fn get_key_replicas(&self, key: &K) -> Vec<&NodeId> {
@@ -184,9 +207,11 @@ where
         let db = StripedDb::new(config.stripes);
         let pending_prepares: Arc<Mutex<HashMap<u64, PendingTx<K, V>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let awaiting_votes: Arc<Mutex<HashMap<u64, mpsc::Sender<(NodeId, bool)>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
         let awaiting_quorum_get: Arc<Mutex<HashMap<u64, mpsc::Sender<(Option<V>, u64)>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let acceptor_log: Arc<Mutex<HashMap<(u64, NodeId), bool>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let tx_trackers: Arc<Mutex<HashMap<u64, Arc<TxVoteTracker<K, V>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
         // this is a barrier
@@ -219,8 +244,9 @@ where
             db,
             version_counter: AtomicU64::new(0),
             awaiting_quorum_get,
-            awaiting_votes,
             pending_prepares,
+            acceptor_log,
+            tx_trackers,
             alive_nodes: Arc::new(Mutex::new(alive_nodes)),
             last_pong: Arc::new(Mutex::new(last_pong)),
             done_count: AtomicUsize::new(0),
@@ -310,7 +336,7 @@ where
                         let _ = sender.send(PeerMessage::Done).await;
                     }
                 }
-                s.mark_done();
+                s.mark_node_done(&my_node_id).await;
             }
         }
     }
@@ -371,43 +397,75 @@ where
                 handle_peer_prepare(&s, from, pairs, tx_id, version);
             }
 
-            PeerMessage::VotePrepared { tx_id } => {
-                debug!("VotePrepared from {} for tx {}", from, tx_id);
-                let tx = {
-                    debug!("VotePrepared: getting lock on awaiting_votes for tx {tx_id}...");
-                    let awaiting = s.awaiting_votes.lock().await;
-                    debug!("VotePrepared: got lock on awaiting_votes for tx {tx_id}");
-                    awaiting.get(&tx_id).cloned()
-                };
-                if let Some(tx) = tx {
-                    let _ = tx.send((from, true)).await;
-                } else {
-                    warn!("VotePrepared: No sender for tx {tx_id}");
-                }
-            }
-            PeerMessage::VoteAbort { tx_id } => {
-                debug!("VoteAbort from {} for tx {}", from, tx_id);
-                let tx = {
-                    debug!("VoteAbort: getting lock on awaiting_votes for tx {tx_id}...");
-                    let awaiting = s.awaiting_votes.lock().await;
-                    debug!("VoteAbort: got lock on awaiting_votes for tx {tx_id}");
-                    awaiting.get(&tx_id).cloned()
-                };
-                if let Some(tx) = tx {
-                    let _ = tx.send((from, false)).await;
-                } else {
-                    warn!("VoteAbort: No sender for tx {tx_id}");
-                }
+            // === Paxos-Commit: Acceptor Role ===
+            PeerMessage::Vote { tx_id, rm_id, vote } => {
+                debug!("Vote from {} for rm {} in tx {}, vote={}", from, rm_id, tx_id, vote);
+                let s = s.clone();
+                tokio::spawn(async move {
+                    // Acceptor: check if already accepted this (tx_id, rm_id)
+                    {
+                        let mut log = s.acceptor_log.lock().await;
+                        let key = (tx_id, rm_id.clone());
+                        if log.contains_key(&key) {
+                            debug!("Already accepted vote for tx {} rm {}, ignoring", tx_id, rm_id);
+                            return;
+                        }
+                        log.insert(key, vote);
+                    }
+
+                    // Broadcast Accepted to all other nodes (phase 2b)
+                    debug!(
+                        "Broadcasting Accepted(rm={}, vote={}) for tx {} to all nodes",
+                        rm_id, vote, tx_id
+                    );
+                    let my_node_id = s.my_node_id.clone();
+                    for (node_id, sender) in s.senders.iter() {
+                        if *node_id != my_node_id {
+                            let _ = sender
+                                .send(PeerMessage::Accepted {
+                                    tx_id,
+                                    rm_id: rm_id.clone(),
+                                    vote,
+                                })
+                                .await;
+                        }
+                    }
+
+                    // Self-update: record this acceptor's confirmation in own tracker
+                    let trackers = s.tx_trackers.lock().await;
+                    if let Some(tracker) = trackers.get(&tx_id) {
+                        let mut rm_votes = tracker.rm_votes.lock().await;
+                        let entry = rm_votes
+                            .entry(rm_id)
+                            .or_insert_with(|| (HashSet::new(), HashSet::new()));
+                        if vote {
+                            entry.0.insert(my_node_id);
+                        } else {
+                            entry.1.insert(my_node_id);
+                        }
+                        tracker.notify.notify_waiters();
+                    }
+                });
             }
 
-            PeerMessage::Commit { tx_id } => {
-                handle_peer_commit(&s, tx_id);
-            }
-
-            PeerMessage::Abort { tx_id } => {
-                debug!("Received Abort for tx {tx_id}, removing from pending_prepares...");
-                s.pending_prepares.lock().await.remove(&tx_id);
-                debug!("Successfully removed tx {tx_id} from pending_prepares");
+            PeerMessage::Accepted { tx_id, rm_id, vote } => {
+                debug!(
+                    "Accepted from {} for rm {} in tx {}, vote={}",
+                    from, rm_id, tx_id, vote
+                );
+                let trackers = s.tx_trackers.lock().await;
+                if let Some(tracker) = trackers.get(&tx_id) {
+                    let mut rm_votes = tracker.rm_votes.lock().await;
+                    let entry = rm_votes
+                        .entry(rm_id)
+                        .or_insert_with(|| (HashSet::new(), HashSet::new()));
+                    if vote {
+                        entry.0.insert(from);
+                    } else {
+                        entry.1.insert(from);
+                    }
+                    tracker.notify.notify_waiters();
+                }
             }
 
             // === Crash Detection ===
@@ -421,7 +479,7 @@ where
             // === Shutdown ===
             PeerMessage::Done => {
                 info!("{} is done with their test", from);
-                s.mark_done();
+                s.mark_node_done(&from).await;
             }
         }
     }
