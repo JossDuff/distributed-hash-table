@@ -24,7 +24,7 @@ use std::{
 };
 use tokio::sync::OwnedMutexGuard;
 use tokio::sync::{mpsc, Mutex, Notify};
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
 const CHANNEL_BUFFER_SIZE: usize = 64;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
@@ -434,11 +434,12 @@ where
 
             PeerMessage::QuorumGetResponse { val, version, req_id } => {
                 debug!("QuorumGetResponse for req {} with version {}", req_id, version);
-                let awaiting = s.awaiting_quorum_get.lock().await;
-                if let Some(tx) = awaiting.get(&req_id) {
-                    let _ = tx.send((val, version)).await;
-                } else {
-                    error!("QuorumGetResponse for unknown req_id {}", req_id);
+                let tx = {
+                    let awaiting = s.awaiting_quorum_get.lock().await;
+                    awaiting.get(&req_id).cloned()
+                };
+                if let Some(tx) = tx {
+                    let _ = tx.try_send((val, version));
                 }
             }
 
@@ -501,8 +502,11 @@ where
                     "Accepted from {} for rm {} in tx {}, vote={}",
                     from, rm_id, tx_id, vote
                 );
-                let trackers = s.tx_trackers.lock().await;
-                if let Some(tracker) = trackers.get(&tx_id) {
+                let tracker = {
+                    let trackers = s.tx_trackers.lock().await;
+                    trackers.get(&tx_id).cloned()
+                };
+                if let Some(tracker) = tracker {
                     let mut rm_votes = tracker.rm_votes.lock().await;
                     let entry = rm_votes
                         .entry(rm_id)
@@ -512,6 +516,7 @@ where
                     } else {
                         entry.1.insert(from);
                     }
+                    drop(rm_votes);
                     tracker.notify.notify_waiters();
                 }
             }

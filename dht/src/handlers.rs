@@ -51,18 +51,22 @@ where
         .insert(req_id, resp_tx.clone());
 
     let s = s.clone();
+    let is_local_replica = alive_replicas.contains(&s.my_node_id);
     tokio::spawn(async move {
-        // Read from local DB if self is a replica, send QuorumGet to remotes
+        // Send QuorumGet to remotes FIRST (non-blocking), then do local read
         for replica in &alive_replicas {
-            if *replica == s.my_node_id {
-                let (val, version) = match s.db.get(&key).await {
-                    Some((v, ver)) => (Some(v), ver),
-                    None => (None, 0),
-                };
-                let _ = resp_tx.send((val, version)).await;
-            } else {
+            if *replica != s.my_node_id {
                 s.send_to_peer(replica, PeerMessage::QuorumGet { key, req_id });
             }
+        }
+
+        // Local read (may block on stripe lock, so do it after remote sends)
+        if is_local_replica {
+            let (val, version) = match s.db.get(&key).await {
+                Some((v, ver)) => (Some(v), ver),
+                None => (None, 0),
+            };
+            let _ = resp_tx.try_send((val, version));
         }
 
         // Collect quorum responses with timeout
@@ -267,6 +271,8 @@ pub(crate) async fn handle_local_write<K, V>(
         // Wait for outcome
         let outcome = tokio::time::timeout(VOTE_LEARN_TIMEOUT, async {
             loop {
+                // Create Notified future BEFORE checking condition to avoid race
+                let notified = tracker.notify.notified();
                 let result = {
                     let rm_votes = tracker.rm_votes.lock().await;
                     let alive = s.alive_nodes.lock().await;
@@ -281,7 +287,7 @@ pub(crate) async fn handle_local_write<K, V>(
                 if let Some(result) = result {
                     return result;
                 }
-                tracker.notify.notified().await;
+                notified.await;
             }
         })
         .await;
@@ -490,6 +496,8 @@ pub(crate) async fn handle_peer_prepare<K, V>(
         // Self-determination: wait for outcome
         let outcome = tokio::time::timeout(PREPARE_LOCK_TIMEOUT, async {
             loop {
+                // Create Notified future BEFORE checking condition to avoid race
+                let notified = tracker.notify.notified();
                 let result = {
                     let rm_votes = tracker.rm_votes.lock().await;
                     let alive = s.alive_nodes.lock().await;
@@ -504,7 +512,7 @@ pub(crate) async fn handle_peer_prepare<K, V>(
                 if let Some(result) = result {
                     return result;
                 }
-                tracker.notify.notified().await;
+                notified.await;
             }
         })
         .await;
