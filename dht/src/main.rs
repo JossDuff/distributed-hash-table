@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Mutex, Semaphore};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 // set the percentage of PUT and TRI_PUT operations.  Everything else is GET
 const PUT_FREQUENCY: usize = 20;
@@ -15,13 +15,15 @@ const TRI_PUT_FREQUENCY: usize = 20;
 
 const NETWORKING_THREADS: usize = 4;
 const OPERATIONS_THREADS: usize = 4;
-const COLLECT_INTERVAL: Duration = Duration::from_secs(1);
+const COLLECT_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_IN_FLIGHT: usize = 64;
+const MAX_RETRIES: usize = 10;
 
 struct IntervalMetrics {
     latency_sum_us: AtomicU64,
     op_count: AtomicU64,
     success_count: AtomicU64,
+    max_retries_hit: AtomicU64,
 }
 
 struct Snapshot {
@@ -95,6 +97,7 @@ async fn run(net_handle: tokio::runtime::Handle) -> Result<()> {
         latency_sum_us: AtomicU64::new(0),
         op_count: AtomicU64::new(0),
         success_count: AtomicU64::new(0),
+        max_retries_hit: AtomicU64::new(0),
     });
     let snapshots: Arc<Mutex<Vec<Snapshot>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -150,24 +153,35 @@ async fn run(net_handle: tokio::runtime::Handle) -> Result<()> {
                     true
                 }
                 Operation::Put { pair } => {
-                    let (response_sender, response_receiver) = oneshot::channel();
-                    let message = LocalMessage::Put {
-                        pair,
-                        response_sender,
-                    };
+                    let mut attempts = 0;
+                    loop {
+                        attempts += 1;
+                        let (response_sender, response_receiver) = oneshot::channel();
+                        let message = LocalMessage::Put {
+                            pair,
+                            response_sender,
+                        };
 
-                    if let Err(e) = sender.send(message).await {
-                        error!("Error sending operation {:?}: {e}", operation);
-                        false
-                    } else {
+                        if let Err(e) = sender.send(message).await {
+                            error!("Error sending operation {:?}: {e}", operation);
+                            break false;
+                        }
                         match response_receiver.await {
-                            Ok(result) => result,
+                            Ok(true) => break true,
+                            Ok(false) if attempts < MAX_RETRIES => {
+                                debug!("Put {:?} failed (attempt {}), retrying", pair.key, attempts);
+                            }
+                            Ok(false) => {
+                                debug!("Put {:?} failed after {} attempts", pair.key, attempts);
+                                m.max_retries_hit.fetch_add(1, Ordering::Relaxed);
+                                break false;
+                            }
                             Err(e) => {
                                 error!(
                                     "Error receiving response for operation {:?}: {e}",
                                     operation
                                 );
-                                false
+                                break false;
                             }
                         }
                     }
@@ -175,35 +189,47 @@ async fn run(net_handle: tokio::runtime::Handle) -> Result<()> {
                 Operation::TriPut { pairs } => {
                     info!("Starting TriPut");
                     let tri_start = Instant::now();
-                    let (response_sender, response_receiver) = oneshot::channel();
-                    let message = LocalMessage::TriPut {
-                        pairs,
-                        response_sender,
-                    };
+                    let mut attempts = 0;
+                    let result = loop {
+                        attempts += 1;
+                        let (response_sender, response_receiver) = oneshot::channel();
+                        let message = LocalMessage::TriPut {
+                            pairs,
+                            response_sender,
+                        };
 
-                    if let Err(e) = sender.send(message).await {
-                        error!("Error sending operation {:?}: {e}", operation);
-                        false
-                    } else {
-                        let result = match response_receiver.await {
-                            Ok(result) => result,
+                        if let Err(e) = sender.send(message).await {
+                            error!("Error sending operation {:?}: {e}", operation);
+                            break false;
+                        }
+                        match response_receiver.await {
+                            Ok(true) => break true,
+                            Ok(false) if attempts < MAX_RETRIES => {
+                                debug!("TriPut failed (attempt {}), retrying", attempts);
+                            }
+                            Ok(false) => {
+                                debug!("TriPut failed after {} attempts", attempts);
+                                m.max_retries_hit.fetch_add(1, Ordering::Relaxed);
+                                break false;
+                            }
                             Err(e) => {
                                 error!(
                                     "Error receiving response for operation {:?}: {e}",
                                     operation
                                 );
-                                false
+                                break false;
                             }
-                        };
-                        let tri_end_ms = tri_start.elapsed().as_millis();
-                        info!("TriPut took {}ms", tri_end_ms);
-                        result
-                    }
+                        }
+                    };
+                    let tri_end_ms = tri_start.elapsed().as_millis();
+                    info!("TriPut took {}ms", tri_end_ms);
+                    result
                 }
             };
 
             let latency = req_start.elapsed();
-            m.latency_sum_us.fetch_add(latency.as_micros() as u64, Ordering::Relaxed);
+            m.latency_sum_us
+                .fetch_add(latency.as_micros() as u64, Ordering::Relaxed);
             m.op_count.fetch_add(1, Ordering::Relaxed);
             if success {
                 m.success_count.fetch_add(1, Ordering::Relaxed);
@@ -224,8 +250,14 @@ async fn run(net_handle: tokio::runtime::Handle) -> Result<()> {
     let _ = collector_handle.await;
 
     let snaps = snapshots.lock().await;
-    info!("=== Interval Metrics ({}s intervals) ===", COLLECT_INTERVAL.as_secs());
-    info!("{:<12} {:>20} {:>20}", "Time(s)", "Successful Txns", "Avg Latency(ms)");
+    info!(
+        "=== Interval Metrics ({}s intervals) ===",
+        COLLECT_INTERVAL.as_secs()
+    );
+    info!(
+        "{:<12} {:>20} {:>20}",
+        "Time(s)", "Successful Txns", "Avg Latency(ms)"
+    );
     for snap in snaps.iter() {
         info!(
             "{:<12.1} {:>20} {:>20.3}",
@@ -247,6 +279,8 @@ async fn run(net_handle: tokio::runtime::Handle) -> Result<()> {
     let p99 = latencies[latencies.len() * 99 / 100];
     let avg = latencies.iter().sum::<Duration>() / latencies.len() as u32;
     info!("Latency avg: {:?}, p50: {:?}, p99: {:?}", avg, p50, p99);
+    let max_retries = metrics.max_retries_hit.load(Ordering::Relaxed);
+    info!("Transactions that hit MAX_RETRIES ({}): {}", MAX_RETRIES, max_retries);
 
     node_handle.await?;
 
