@@ -9,8 +9,12 @@ use anyhow::Result;
 pub use config::Config;
 use db::StripedDb;
 use handlers::{handle_local_get, handle_local_write, handle_peer_prepare};
-pub use messages::{LocalMessage, PeerMessage};
+pub use messages::{
+    ClientHello, ClientMessage, ClientResponse, FirstMessage, LocalMessage, PeerMessage,
+    ReadyPeerMessage,
+};
 use net::{connect_all, Peers};
+pub use net::{get_connect_str, recv_msg, send_msg};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
@@ -177,8 +181,10 @@ where
     K: Clone,
 {
     shared: Arc<Shared<K, V>>,
+    local_sender: mpsc::Sender<LocalMessage<K, V>>,
     local_inbox: mpsc::Receiver<LocalMessage<K, V>>,
     peer_inbox: mpsc::Receiver<(NodeId, PeerMessage<K, V>)>,
+    client_rx: mpsc::Receiver<tokio::net::TcpStream>,
 }
 
 impl<K, V> Node<K, V>
@@ -199,7 +205,7 @@ where
     pub async fn new(
         config: Config,
         net_handle: &tokio::runtime::Handle,
-    ) -> Result<(Self, mpsc::Sender<LocalMessage<K, V>>)> {
+    ) -> Result<Self> {
         let db = StripedDb::new(config.stripes);
         let pending_prepares: Arc<Mutex<HashMap<u64, PendingTx<K, V>>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -210,11 +216,11 @@ where
         let tx_trackers: Arc<Mutex<HashMap<u64, Arc<TxVoteTracker>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        // this is a barrier
-        let (peers, cluster, my_node_id): (Peers<K, V>, Vec<NodeId>, NodeId) =
+        // this is a barrier — also returns client connection receiver
+        let (peers, cluster, my_node_id, client_rx): (Peers<K, V>, Vec<NodeId>, NodeId, _) =
             connect_all::<K, V>(&config.name, &config.connections, net_handle).await?;
 
-        // for sending/ receiving messages from the test harness
+        // for sending/ receiving messages from client handlers
         let (local_sender, local_inbox) = mpsc::channel(CHANNEL_BUFFER_SIZE);
 
         // Destructure Peers so we can give the inbox to one task and
@@ -249,26 +255,36 @@ where
             shutdown: Notify::new(),
         });
 
-        Ok((
-            Self {
-                shared,
-                local_inbox,
-                peer_inbox,
-            },
+        Ok(Self {
+            shared,
             local_sender,
-        ))
+            local_inbox,
+            peer_inbox,
+            client_rx,
+        })
     }
 
-    // Split into two independent tasks, each with its own receiver.
+    // Split into independent tasks, each with its own receiver.
     pub async fn run(self) -> Result<()> {
         let shared_local = self.shared.clone();
         let shared_peer = self.shared.clone();
         let shared_heartbeat = self.shared.clone();
         let shutdown = self.shared.clone();
 
+        let local_sender = self.local_sender;
+        let mut client_rx = self.client_rx;
+
         let local_handle = tokio::spawn(run_local_loop(shared_local, self.local_inbox));
         let peer_handle = tokio::spawn(run_peer_loop(shared_peer, self.peer_inbox));
         let heartbeat_handle = tokio::spawn(spawn_heartbeat_task(shared_heartbeat));
+
+        // Accept client connections and spawn handlers
+        let client_handle = tokio::spawn(async move {
+            while let Some(stream) = client_rx.recv().await {
+                let sender = local_sender.clone();
+                tokio::spawn(run_client_handler(stream, sender));
+            }
+        });
 
         // Wait for shutdown signal (done_count >= cluster.len())
         shutdown.shutdown.notified().await;
@@ -278,13 +294,103 @@ where
         local_handle.abort();
         peer_handle.abort();
         heartbeat_handle.abort();
+        client_handle.abort();
 
         // Swallow JoinErrors from the aborts
         let _ = local_handle.await;
         let _ = peer_handle.await;
         let _ = heartbeat_handle.await;
+        let _ = client_handle.await;
 
         Ok(())
+    }
+}
+
+/// Handles a single client TCP connection: reads ClientMessage, translates to
+/// LocalMessage, awaits the response, and writes ClientResponse back.
+async fn run_client_handler<K, V>(
+    stream: tokio::net::TcpStream,
+    local_sender: mpsc::Sender<LocalMessage<K, V>>,
+) where
+    K: Send
+        + Sync
+        + 'static
+        + Debug
+        + Serialize
+        + for<'de> Deserialize<'de>
+        + Hash
+        + Eq
+        + PartialEq
+        + Clone
+        + Copy,
+    V: Send + Sync + 'static + Debug + Serialize + for<'de> Deserialize<'de> + Clone,
+{
+    let (mut read_half, write_half) = stream.into_split();
+    let write_half = Arc::new(Mutex::new(write_half));
+
+    loop {
+        let msg: ClientMessage<K, V> = match net::recv_msg(&mut read_half).await {
+            Ok(m) => m,
+            Err(_) => {
+                info!("Client disconnected");
+                break;
+            }
+        };
+
+        match msg {
+            ClientMessage::Get { key, req_id } => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = local_sender
+                    .send(LocalMessage::Get {
+                        key,
+                        response_sender: tx,
+                    })
+                    .await;
+                let wh = write_half.clone();
+                tokio::spawn(async move {
+                    let val = rx.await.unwrap_or(None);
+                    let resp: ClientResponse<V> = ClientResponse::GetResult { val, req_id };
+                    let mut w = wh.lock().await;
+                    let _ = net::send_msg(&mut *w, &resp).await;
+                });
+            }
+            ClientMessage::Put { pair, req_id } => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = local_sender
+                    .send(LocalMessage::Put {
+                        pair,
+                        response_sender: tx,
+                    })
+                    .await;
+                let wh = write_half.clone();
+                tokio::spawn(async move {
+                    let success = rx.await.unwrap_or(false);
+                    let resp: ClientResponse<V> = ClientResponse::WriteResult { success, req_id };
+                    let mut w = wh.lock().await;
+                    let _ = net::send_msg(&mut *w, &resp).await;
+                });
+            }
+            ClientMessage::TriPut { pairs, req_id } => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = local_sender
+                    .send(LocalMessage::TriPut {
+                        pairs,
+                        response_sender: tx,
+                    })
+                    .await;
+                let wh = write_half.clone();
+                tokio::spawn(async move {
+                    let success = rx.await.unwrap_or(false);
+                    let resp: ClientResponse<V> = ClientResponse::WriteResult { success, req_id };
+                    let mut w = wh.lock().await;
+                    let _ = net::send_msg(&mut *w, &resp).await;
+                });
+            }
+            ClientMessage::Done => {
+                let _ = local_sender.send(LocalMessage::Done).await;
+                break;
+            }
+        }
     }
 }
 

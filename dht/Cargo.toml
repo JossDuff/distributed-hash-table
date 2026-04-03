@@ -3,6 +3,14 @@ name = "dht"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "dht"
+path = "src/main.rs"
+
+[[bin]]
+name = "dht-client"
+path = "src/bin/client.rs"
+
 [dependencies]
 paxos-commit = { path = "../paxos-commit" }
 

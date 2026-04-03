@@ -121,7 +121,7 @@ cmd_kill() {
     for node in "${ALL_NODES[@]}"; do
         local host="${node}.${DOMAIN}"
         result=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 -o BatchMode=yes \
-            "${USERNAME}@${host}" "pkill -u $USERNAME $binary_name && echo 'killed' || echo 'none'" 2>/dev/null)
+            "${USERNAME}@${host}" "pkill -u $USERNAME -x $binary_name && echo 'killed' || echo 'none'" 2>/dev/null)
         if [[ "$result" == "killed" ]]; then
             echo -e "${YELLOW}[$node]${NC} killed $binary_name"
         fi
@@ -347,7 +347,7 @@ cmd_run() {
         for node in "${nodes[@]}"; do
             local host="${node}.${DOMAIN}"
             ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
-                "${USERNAME}@${host}" "pkill -u $USERNAME dht" 2>/dev/null
+                "${USERNAME}@${host}" "pkill -u $USERNAME -x dht; pkill -u $USERNAME dht-client" 2>/dev/null
         done
 
         echo ""
@@ -364,24 +364,31 @@ cmd_run() {
         local connections
         connections=$(get_connections "$node" "${nodes[@]}")
 
-        local cmd="cd $project_dir && cargo build --release --quiet --target-dir $TARGET_DIR && export RUST_LOG=$rust_log && $TARGET_DIR/release/dht --name $node --connections $connections"
-        if [[ -n "$num_keys" ]]; then
-            cmd="$cmd --num-keys $num_keys"
-        fi
-        if [[ -n "$key_range" ]]; then
-            cmd="$cmd --key-range $key_range"
-        fi
+        # Build the node command
+        local node_cmd="$TARGET_DIR/release/dht --name $node --connections $connections"
         if [[ -n "$replication_degree" ]]; then
-            cmd="$cmd --repication-degree $replication_degree"
+            node_cmd="$node_cmd --repication-degree $replication_degree"
         fi
         if [[ -n "$stripes" ]]; then
-            cmd="$cmd --stripes $stripes"
+            node_cmd="$node_cmd --stripes $stripes"
         fi
         if [[ -n "$program_args" ]]; then
-            cmd="$cmd $program_args"
+            node_cmd="$node_cmd $program_args"
         fi
 
-        echo -e "${YELLOW}[$node]${NC} starting (connects to: $connections)"
+        # Build the client command
+        local client_cmd="$TARGET_DIR/release/dht-client --name $node --connections $connections"
+        if [[ -n "$num_keys" ]]; then
+            client_cmd="$client_cmd --num-keys $num_keys"
+        fi
+        if [[ -n "$key_range" ]]; then
+            client_cmd="$client_cmd --key-range $key_range"
+        fi
+
+        # Combined: build, start node in background, wait, then start client in foreground
+        local cmd="cd $project_dir && cargo build --release --quiet --target-dir $TARGET_DIR && export RUST_LOG=$rust_log && $node_cmd & sleep 2 && $client_cmd"
+
+        echo -e "${YELLOW}[$node]${NC} starting node + client (connects to: $connections)"
 
         ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
             "${USERNAME}@${host}" "$cmd" \
