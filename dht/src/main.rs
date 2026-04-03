@@ -132,7 +132,7 @@ async fn run(net_handle: tokio::runtime::Handle) -> Result<()> {
         let m = metrics.clone();
         let sem = semaphore.clone();
         handles.push(tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
+            let mut permit = sem.acquire().await.unwrap();
             let req_start = Instant::now();
             let success = match operation {
                 Operation::Get { key } => {
@@ -170,6 +170,11 @@ async fn run(net_handle: tokio::runtime::Handle) -> Result<()> {
                             Ok(true) => break true,
                             Ok(false) if attempts < MAX_RETRIES => {
                                 debug!("Put {:?} failed (attempt {}), retrying", pair.key, attempts);
+                                drop(permit);
+                                let backoff = Duration::from_millis(10 * (1 << attempts.min(5)))
+                                    + Duration::from_millis(rand::random_range(0..20));
+                                tokio::time::sleep(backoff).await;
+                                permit = sem.acquire().await.unwrap();
                             }
                             Ok(false) => {
                                 debug!("Put {:?} failed after {} attempts", pair.key, attempts);
@@ -206,6 +211,11 @@ async fn run(net_handle: tokio::runtime::Handle) -> Result<()> {
                             Ok(true) => break true,
                             Ok(false) if attempts < MAX_RETRIES => {
                                 debug!("TriPut failed (attempt {}), retrying", attempts);
+                                drop(permit);
+                                let backoff = Duration::from_millis(10 * (1 << attempts.min(5)))
+                                    + Duration::from_millis(rand::random_range(0..20));
+                                tokio::time::sleep(backoff).await;
+                                permit = sem.acquire().await.unwrap();
                             }
                             Ok(false) => {
                                 debug!("TriPut failed after {} attempts", attempts);
