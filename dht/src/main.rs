@@ -6,7 +6,7 @@ use rand::{rngs::ThreadRng, Rng};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, Semaphore};
 use tracing::{error, info};
 
 // set the percentage of PUT and TRI_PUT operations.  Everything else is GET
@@ -16,6 +16,7 @@ const TRI_PUT_FREQUENCY: usize = 20;
 const NETWORKING_THREADS: usize = 4;
 const OPERATIONS_THREADS: usize = 4;
 const COLLECT_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_IN_FLIGHT: usize = 64;
 
 struct IntervalMetrics {
     latency_sum_us: AtomicU64,
@@ -119,12 +120,16 @@ async fn run(net_handle: tokio::runtime::Handle) -> Result<()> {
         }
     });
 
+    let semaphore = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
+
     for i in 0..test_data.len() {
         print_progress(i, test_data.len());
         let operation = test_data[i];
         let sender = sender.clone();
         let m = metrics.clone();
+        let sem = semaphore.clone();
         handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
             let req_start = Instant::now();
             let success = match operation {
                 Operation::Get { key } => {

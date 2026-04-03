@@ -61,9 +61,7 @@ where
                 };
                 let _ = resp_tx.send((val, version)).await;
             } else {
-                let _ = s
-                    .send_to_peer(replica, PeerMessage::QuorumGet { key, req_id })
-                    .await;
+                s.send_to_peer(replica, PeerMessage::QuorumGet { key, req_id });
             }
         }
 
@@ -180,16 +178,14 @@ pub(crate) async fn handle_local_write<K, V>(
         // Send Prepare to remote RMs FIRST (so their trackers exist before our Vote arrives)
         for rm in &remote_rms {
             debug!("local_write tx {}: sending Prepare to {}", tx_id, rm);
-            let _ = s
-                .send_to_peer(
-                    rm,
-                    PeerMessage::Prepare {
-                        pairs: pairs.clone(),
-                        tx_id,
-                        version,
-                    },
-                )
-                .await;
+            s.send_to_peer(
+                rm,
+                PeerMessage::Prepare {
+                    pairs: pairs.clone(),
+                    tx_id,
+                    version,
+                },
+            );
         }
 
         // Local prepare
@@ -236,20 +232,16 @@ pub(crate) async fn handle_local_write<K, V>(
                 .insert((tx_id, my_node_id.clone()), vote);
             for (node_id, sender) in s.senders.iter() {
                 if *node_id != my_node_id {
-                    let _ = sender
-                        .send(PeerMessage::Vote {
-                            tx_id,
-                            rm_id: my_node_id.clone(),
-                            vote,
-                        })
-                        .await;
-                    let _ = sender
-                        .send(PeerMessage::Accepted {
-                            tx_id,
-                            rm_id: my_node_id.clone(),
-                            vote,
-                        })
-                        .await;
+                    let _ = sender.try_send(PeerMessage::Vote {
+                        tx_id,
+                        rm_id: my_node_id.clone(),
+                        vote,
+                    });
+                    let _ = sender.try_send(PeerMessage::Accepted {
+                        tx_id,
+                        rm_id: my_node_id.clone(),
+                        vote,
+                    });
                 }
             }
 
@@ -468,20 +460,16 @@ pub(crate) async fn handle_peer_prepare<K, V>(
         );
         for (node_id, sender) in s.senders.iter() {
             if *node_id != my_node_id {
-                let _ = sender
-                    .send(PeerMessage::Vote {
-                        tx_id,
-                        rm_id: my_node_id.clone(),
-                        vote,
-                    })
-                    .await;
-                let _ = sender
-                    .send(PeerMessage::Accepted {
-                        tx_id,
-                        rm_id: my_node_id.clone(),
-                        vote,
-                    })
-                    .await;
+                let _ = sender.try_send(PeerMessage::Vote {
+                    tx_id,
+                    rm_id: my_node_id.clone(),
+                    vote,
+                });
+                let _ = sender.try_send(PeerMessage::Accepted {
+                    tx_id,
+                    rm_id: my_node_id.clone(),
+                    vote,
+                });
             }
         }
 

@@ -5,7 +5,7 @@ mod handlers;
 mod messages;
 mod net;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 pub use config::Config;
 use db::StripedDb;
 use handlers::{handle_local_get, handle_local_write, handle_peer_prepare};
@@ -159,17 +159,14 @@ where
             .collect()
     }
 
-    // Send a message to a peer.  Awaits until the bounded channel has space.
-    // This is fine because each task has its own receiver — a blocked send
-    // here can never prevent the *other* task from draining its inbox.
-    pub(crate) async fn send_to_peer(&self, target: &NodeId, msg: PeerMessage<K, V>) -> Result<()> {
+    // Send a message to a peer (non-blocking).
+    // Drops the message if the channel is full — Paxos tolerates message loss.
+    pub(crate) fn send_to_peer(&self, target: &NodeId, msg: PeerMessage<K, V>) {
         if let Some(sender) = self.senders.get(target) {
-            sender
-                .send(msg)
-                .await
-                .map_err(|_| anyhow!("Channel to {} closed", target))?;
+            if let Err(mpsc::error::TrySendError::Full(_)) = sender.try_send(msg) {
+                debug!("Channel to {} full, dropping message", target);
+            }
         }
-        Ok(())
     }
 }
 
@@ -319,7 +316,7 @@ where
                 .collect()
         };
         for node in &alive {
-            let _ = s.send_to_peer(node, PeerMessage::Ping).await;
+            s.send_to_peer(node, PeerMessage::Ping);
         }
 
         // Check for timed-out peers
@@ -430,7 +427,7 @@ where
                     let resp: PeerMessage<K, V> =
                         PeerMessage::QuorumGetResponse { val, version, req_id };
                     if let Some(sender) = senders.get(&from) {
-                        let _ = sender.send(resp).await;
+                        let _ = sender.try_send(resp);
                     }
                 });
             }
@@ -474,13 +471,11 @@ where
                     let my_node_id = s.my_node_id.clone();
                     for (node_id, sender) in s.senders.iter() {
                         if *node_id != my_node_id {
-                            let _ = sender
-                                .send(PeerMessage::Accepted {
-                                    tx_id,
-                                    rm_id: rm_id.clone(),
-                                    vote,
-                                })
-                                .await;
+                            let _ = sender.try_send(PeerMessage::Accepted {
+                                tx_id,
+                                rm_id: rm_id.clone(),
+                                vote,
+                            });
                         }
                     }
 
@@ -523,7 +518,7 @@ where
 
             // === Crash Detection ===
             PeerMessage::Ping => {
-                let _ = s.send_to_peer(&from, PeerMessage::Pong).await;
+                s.send_to_peer(&from, PeerMessage::Pong);
             }
             PeerMessage::Pong => {
                 s.last_pong.lock().await.insert(from, Instant::now());
