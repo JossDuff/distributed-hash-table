@@ -5,11 +5,16 @@ use crate::{
 use anyhow::Result;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::{collections::{HashMap, HashSet}, fmt::Debug, hash::Hash, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+    hash::Hash,
+    sync::Arc,
+};
 use tokio::sync::{mpsc, oneshot, Mutex, Notify, OwnedMutexGuard};
 use tracing::debug;
 
-/// 5a. Quorum read: read from alive replicas, return highest-versioned value.
+/// Quorum read: read from alive replicas, return highest-versioned value.
 pub(crate) async fn handle_local_get<K, V>(
     s: &Arc<Shared<K, V>>,
     key: K,
@@ -53,7 +58,13 @@ where
     let s = s.clone();
     let is_local_replica = alive_replicas.contains(&s.my_node_id);
     tokio::spawn(async move {
-        debug!("get req {}: spawned, key={:?}, replicas={}, local={}", req_id, key, alive_replicas.len(), is_local_replica);
+        debug!(
+            "get req {}: spawned, key={:?}, replicas={}, local={}",
+            req_id,
+            key,
+            alive_replicas.len(),
+            is_local_replica
+        );
         // Send QuorumGet to remotes FIRST (non-blocking), then do local read
         for replica in &alive_replicas {
             if *replica != s.my_node_id {
@@ -64,7 +75,11 @@ where
 
         // Local read (may block on stripe lock, so do it after remote sends)
         if is_local_replica {
-            debug!("get req {}: starting local db.get, stripe={}", req_id, s.db.stripe_index(&key));
+            debug!(
+                "get req {}: starting local db.get, stripe={}",
+                req_id,
+                s.db.stripe_index(&key)
+            );
             let (val, version) = match s.db.get(&key).await {
                 Some((v, ver)) => (Some(v), ver),
                 None => (None, 0),
@@ -89,7 +104,12 @@ where
         })
         .await;
 
-        debug!("get req {}: collection done, got {} responses (need {})", req_id, responses.len(), quorum);
+        debug!(
+            "get req {}: collection done, got {} responses (need {})",
+            req_id,
+            responses.len(),
+            quorum
+        );
         s.awaiting_quorum_get.lock().await.remove(&req_id);
         let result = if responses.len() >= quorum {
             paxos_commit::select_best_read(&responses)
@@ -108,7 +128,7 @@ where
     Ok(())
 }
 
-/// 5b. Paxos-Commit write (unified handler for put and triput).
+/// Paxos-Commit write (unified handler for put and triput).
 ///
 /// Creates TxVoteTracker inline (before spawning) so the peer loop can
 /// deliver Accepted messages immediately. Spawns a task for lock acquisition,
@@ -206,8 +226,7 @@ pub(crate) async fn handle_local_write<K, V>(
         let local_voted_prepared = if is_local_rm {
             local_entries.sort_by_key(|(_, idx)| *idx);
 
-            let mut guards: HashMap<usize, OwnedMutexGuard<HashMap<K, (V, u64)>>> =
-                HashMap::new();
+            let mut guards: HashMap<usize, OwnedMutexGuard<HashMap<K, (V, u64)>>> = HashMap::new();
             let mut lock_failed = false;
             for (_, idx) in &local_entries {
                 if !guards.contains_key(idx) {
@@ -310,14 +329,8 @@ pub(crate) async fn handle_local_write<K, V>(
                 debug!("local_write tx {}: timeout, re-evaluating", tx_id);
                 let rm_votes = tracker.rm_votes.lock().await;
                 let alive = s.alive_nodes.lock().await;
-                paxos_commit::evaluate_commit_rule(
-                    &key_replica_vecs,
-                    &rm_votes,
-                    quorum,
-                    aq,
-                    &alive,
-                )
-                .unwrap_or(false)
+                paxos_commit::evaluate_commit_rule(&key_replica_vecs, &rm_votes, quorum, aq, &alive)
+                    .unwrap_or(false)
             }
         };
 
@@ -334,7 +347,10 @@ pub(crate) async fn handle_local_write<K, V>(
                             guard.insert(pair.key, (pair.val.clone(), tx.version));
                         }
                     }
-                    debug!("local_write tx {}: released stripe locks {:?}", tx_id, stripes);
+                    debug!(
+                        "local_write tx {}: released stripe locks {:?}",
+                        tx_id, stripes
+                    );
                 }
             } else if is_local_rm {
                 // Voted Aborted but tx committed: apply via db.put()
@@ -349,7 +365,10 @@ pub(crate) async fn handle_local_write<K, V>(
             let mut pending = s.pending_prepares.lock().await;
             if let Some(tx) = pending.remove(&tx_id) {
                 let stripes: Vec<usize> = tx.pairs.iter().map(|(_, idx)| *idx).collect();
-                debug!("local_write tx {}: releasing stripe locks {:?}", tx_id, stripes);
+                debug!(
+                    "local_write tx {}: releasing stripe locks {:?}",
+                    tx_id, stripes
+                );
             }
         }
 
@@ -365,7 +384,7 @@ pub(crate) async fn handle_local_write<K, V>(
     });
 }
 
-/// 5c. RM role: receive Prepare, create tracker (inline), then spawn
+/// RM role: receive Prepare, create tracker (inline), then spawn
 /// lock acquisition + voting + self-determination task.
 ///
 /// The tracker is created before spawning so that Accepted messages arriving
@@ -453,7 +472,10 @@ pub(crate) async fn handle_peer_prepare<K, V>(
                         guards.insert(*idx, guard);
                     }
                     Err(_) => {
-                        debug!("peer_prepare tx {}: timed lock failed stripe {}", tx_id, idx);
+                        debug!(
+                            "peer_prepare tx {}: timed lock failed stripe {}",
+                            tx_id, idx
+                        );
                         lock_failed = true;
                         break;
                     }
@@ -565,7 +587,10 @@ pub(crate) async fn handle_peer_prepare<K, V>(
                             guard.insert(pair.key, (pair.val.clone(), tx.version));
                         }
                     }
-                    debug!("peer_prepare tx {}: released stripe locks {:?}", tx_id, stripes);
+                    debug!(
+                        "peer_prepare tx {}: released stripe locks {:?}",
+                        tx_id, stripes
+                    );
                 }
             } else {
                 // Voted Aborted but tx committed: apply via db.put()
@@ -580,7 +605,10 @@ pub(crate) async fn handle_peer_prepare<K, V>(
             let mut pending = s.pending_prepares.lock().await;
             if let Some(tx) = pending.remove(&tx_id) {
                 let stripes: Vec<usize> = tx.pairs.iter().map(|(_, idx)| *idx).collect();
-                debug!("peer_prepare tx {}: releasing stripe locks {:?}", tx_id, stripes);
+                debug!(
+                    "peer_prepare tx {}: releasing stripe locks {:?}",
+                    tx_id, stripes
+                );
             }
         }
 

@@ -169,7 +169,10 @@ async fn run(net_handle: tokio::runtime::Handle) -> Result<()> {
                         match response_receiver.await {
                             Ok(true) => break true,
                             Ok(false) if attempts < MAX_RETRIES => {
-                                debug!("Put {:?} failed (attempt {}), retrying", pair.key, attempts);
+                                debug!(
+                                    "Put {:?} failed (attempt {}), retrying",
+                                    pair.key, attempts
+                                );
                                 drop(permit);
                                 let backoff = Duration::from_millis(10 * (1 << attempts.min(5)))
                                     + Duration::from_millis(rand::random_range(0..20));
@@ -290,7 +293,10 @@ async fn run(net_handle: tokio::runtime::Handle) -> Result<()> {
     let avg = latencies.iter().sum::<Duration>() / latencies.len() as u32;
     info!("Latency avg: {:?}, p50: {:?}, p99: {:?}", avg, p50, p99);
     let max_retries = metrics.max_retries_hit.load(Ordering::Relaxed);
-    info!("Transactions that hit MAX_RETRIES ({}): {}", MAX_RETRIES, max_retries);
+    info!(
+        "Transactions that hit MAX_RETRIES ({}): {}",
+        MAX_RETRIES, max_retries
+    );
 
     node_handle.await?;
 
@@ -312,6 +318,7 @@ fn generate_test_operations(num_operations: usize, key_range: u64) -> Vec<Operat
                     },
                 }
             } else if roll < total {
+                // generate 3 UNIQUE keys
                 let k1 = rng.random_range(0..key_range);
                 let k2 = unique_random(k1, k1, &mut rng, key_range);
                 let k3 = unique_random(k1, k2, &mut rng, key_range);
