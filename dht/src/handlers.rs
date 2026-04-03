@@ -1,6 +1,6 @@
 use crate::{
     KVPair, NodeId, PeerMessage, PendingTx, Shared, TxVoteTracker, PREPARE_LOCK_TIMEOUT,
-    QUORUM_READ_TIMEOUT, VOTE_LEARN_TIMEOUT,
+    QUORUM_READ_TIMEOUT, STRIPE_LOCK_TIMEOUT, VOTE_LEARN_TIMEOUT,
 };
 use anyhow::Result;
 use rand::Rng;
@@ -212,13 +212,13 @@ pub(crate) async fn handle_local_write<K, V>(
             for (_, idx) in &local_entries {
                 if !guards.contains_key(idx) {
                     let stripe = s.db.get_stripe_by_index(*idx);
-                    match stripe.try_lock_owned() {
+                    match tokio::time::timeout(STRIPE_LOCK_TIMEOUT, stripe.lock_owned()).await {
                         Ok(guard) => {
                             debug!("local_write tx {}: locked stripe {}", tx_id, idx);
                             guards.insert(*idx, guard);
                         }
                         Err(_) => {
-                            debug!("local_write tx {}: try_lock failed stripe {}", tx_id, idx);
+                            debug!("local_write tx {}: timed lock failed stripe {}", tx_id, idx);
                             lock_failed = true;
                             break;
                         }
@@ -447,13 +447,13 @@ pub(crate) async fn handle_peer_prepare<K, V>(
         for (_, idx) in &my_entries {
             if !guards.contains_key(idx) {
                 let stripe = s.db.get_stripe_by_index(*idx);
-                match stripe.try_lock_owned() {
+                match tokio::time::timeout(STRIPE_LOCK_TIMEOUT, stripe.lock_owned()).await {
                     Ok(guard) => {
                         debug!("peer_prepare tx {}: locked stripe {}", tx_id, idx);
                         guards.insert(*idx, guard);
                     }
                     Err(_) => {
-                        debug!("peer_prepare tx {}: try_lock failed stripe {}", tx_id, idx);
+                        debug!("peer_prepare tx {}: timed lock failed stripe {}", tx_id, idx);
                         lock_failed = true;
                         break;
                     }

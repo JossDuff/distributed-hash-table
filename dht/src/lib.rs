@@ -32,6 +32,7 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(500);
 pub(crate) const VOTE_LEARN_TIMEOUT: Duration = Duration::from_millis(500);
 pub(crate) const PREPARE_LOCK_TIMEOUT: Duration = Duration::from_millis(2000);
 pub(crate) const QUORUM_READ_TIMEOUT: Duration = Duration::from_millis(200);
+pub(crate) const STRIPE_LOCK_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct KVPair<K, V>
