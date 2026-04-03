@@ -140,8 +140,14 @@ async fn run() -> Result<()> {
             } else {
                 0.0
             };
+            let elapsed_secs = collector_start.elapsed().as_secs_f64();
+            let ops_sec = success as f64 / COLLECT_INTERVAL.as_secs_f64();
+            info!(
+                "{:.1}s | txns: {} | ops/sec: {:.0} | avg_latency: {:.3}ms",
+                elapsed_secs, success, ops_sec, avg_lat
+            );
             collector_snapshots.lock().await.push(Snapshot {
-                elapsed_secs: collector_start.elapsed().as_secs_f64(),
+                elapsed_secs,
                 avg_latency_ms: avg_lat,
                 successful_txns: success,
             });
@@ -351,13 +357,14 @@ async fn connect_to_node(
     let (read_half, write_half) = stream.into_split();
     let writer = Arc::new(Mutex::new(write_half));
 
-    let reader_handle = tokio::spawn(client_reader_task(read_half, pending, disconnect));
+    let reader_handle = tokio::spawn(client_reader_task(node_name.to_string(), read_half, pending, disconnect));
 
     Ok((writer, reader_handle))
 }
 
 /// Reader task: reads ClientResponse from a node, dispatches to pending oneshot senders.
 async fn client_reader_task(
+    node_name: String,
     mut read_half: OwnedReadHalf,
     pending: PendingMap,
     disconnect: Arc<Notify>,
@@ -374,7 +381,7 @@ async fn client_reader_task(
                 }
             }
             Err(_) => {
-                info!("Connection to node lost, triggering failover");
+                info!("Node '{}' died — connection lost, triggering failover", node_name);
                 disconnect.notify_waiters();
                 break;
             }

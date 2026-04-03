@@ -47,6 +47,7 @@ Options:
   -s <num>      Number of locked sections in the database (default: 256)
   -d <dir>      Project directory (default: current directory)
   -v            Enable debug logging (RUST_LOG=debug instead of info)
+  --kill <sec>  Kill a random node after <sec> seconds (fault tolerance test)
   -h, --help    Show this help
 
 Examples:
@@ -57,6 +58,7 @@ Examples:
   sun.sh run -n 3 -k 100000 -r 1000
   sun.sh run -n 3 -R 3                 Run with replication degree 3
   sun.sh run -n 3 -s 512               Run with 512 stripes
+  sun.sh run -n 4 -R 3 --kill 10       Kill a random node after 10s
   sun.sh run -n 3 -- --extra-flag
   sun.sh exec -n 3 -- hostname
   sun.sh exec -n 5 -- "cd ~/dev/project && ./my_script.sh"
@@ -295,7 +297,8 @@ cmd_run() {
     local replication_degree="$5"
     local stripes="$6"
     local rust_log="$7"
-    shift 7
+    local kill_after="$8"
+    shift 8
     local program_args="$*"
 
     echo -e "${GREEN}=== Running on Cluster ===${NC}"
@@ -323,6 +326,9 @@ cmd_run() {
     if [[ -n "$stripes" ]]; then
         echo -e "Stripes: ${BLUE}$stripes${NC}"
     fi
+    if [[ -n "$kill_after" ]]; then
+        echo -e "Kill after: ${BLUE}${kill_after}s${NC}"
+    fi
     if [[ -n "$program_args" ]]; then
         echo -e "Extra args: ${BLUE}$program_args${NC}"
     fi
@@ -335,10 +341,15 @@ cmd_run() {
     echo ""
 
     declare -A PIDS
+    KILL_PID=""
 
     cleanup() {
         echo ""
         echo -e "${RED}Caught interrupt, stopping all nodes...${NC}"
+
+        if [[ -n "$KILL_PID" ]]; then
+            kill "$KILL_PID" 2>/dev/null
+        fi
 
         for node in "${!PIDS[@]}"; do
             kill "${PIDS[$node]}" 2>/dev/null && echo -e "${YELLOW}[$node]${NC} stopped"
@@ -402,6 +413,21 @@ cmd_run() {
     echo -e "${YELLOW}Press Ctrl+C to stop all nodes${NC}"
     echo ""
 
+    # Kill timer: after specified seconds, kill a random node's dht process
+    if [[ -n "$kill_after" ]]; then
+        kill_index=$(( RANDOM % ${#nodes[@]} ))
+        kill_node="${nodes[$kill_index]}"
+        echo -e "${RED}[KILL] Will kill node '${kill_node}' after ${kill_after}s${NC}"
+        (
+            sleep "$kill_after"
+            echo -e "${RED}[KILL] Killing node '${kill_node}' now...${NC}"
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
+                "${USERNAME}@${kill_node}.${DOMAIN}" "pkill -u $USERNAME -x dht" 2>/dev/null
+            echo -e "${RED}[KILL] Node '${kill_node}' has been killed${NC}"
+        ) &
+        KILL_PID=$!
+    fi
+
     failed=0
     for node in "${!PIDS[@]}"; do
         if wait "${PIDS[$node]}"; then
@@ -411,6 +437,12 @@ cmd_run() {
             ((failed++))
         fi
     done
+
+    # Clean up kill timer if still running
+    if [[ -n "$KILL_PID" ]]; then
+        kill "$KILL_PID" 2>/dev/null
+        wait "$KILL_PID" 2>/dev/null
+    fi
 
     echo ""
     echo -e "${GREEN}=== Run Complete ===${NC}"
@@ -461,6 +493,7 @@ KEY_RANGE=""
 REPLICATION_DEGREE=""
 STRIPES=""
 RUST_LOG="info"
+KILL_AFTER=""
 EXTRA_ARGS=""
 
 while [[ $# -gt 0 ]]; do
@@ -493,6 +526,10 @@ while [[ $# -gt 0 ]]; do
         RUST_LOG="debug"
         shift
         ;;
+    --kill)
+        KILL_AFTER="$2"
+        shift 2
+        ;;
     -h | --help)
         usage
         ;;
@@ -522,7 +559,7 @@ run)
         echo -e "${RED}Error: Number of nodes must be a positive integer${NC}"
         exit 1
     fi
-    cmd_run "$NUM_NODES" "$PROJECT_DIR" "$NUM_KEYS" "$KEY_RANGE" "$REPLICATION_DEGREE" "$STRIPES" "$RUST_LOG" $EXTRA_ARGS
+    cmd_run "$NUM_NODES" "$PROJECT_DIR" "$NUM_KEYS" "$KEY_RANGE" "$REPLICATION_DEGREE" "$STRIPES" "$RUST_LOG" "$KILL_AFTER" $EXTRA_ARGS
     ;;
 exec)
     if [[ -z "$NUM_NODES" ]]; then
