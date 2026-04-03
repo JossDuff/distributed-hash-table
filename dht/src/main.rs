@@ -3,8 +3,10 @@ use clap::Parser;
 use dht::KVPair;
 use dht::{Config, LocalMessage, Node};
 use rand::{rngs::ThreadRng, Rng};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Mutex};
 use tracing::{error, info};
 
 // set the percentage of PUT and TRI_PUT operations.  Everything else is GET
@@ -13,6 +15,19 @@ const TRI_PUT_FREQUENCY: usize = 20;
 
 const NETWORKING_THREADS: usize = 4;
 const OPERATIONS_THREADS: usize = 4;
+const COLLECT_INTERVAL: Duration = Duration::from_secs(1);
+
+struct IntervalMetrics {
+    latency_sum_us: AtomicU64,
+    op_count: AtomicU64,
+    success_count: AtomicU64,
+}
+
+struct Snapshot {
+    elapsed_secs: f64,
+    avg_latency_ms: f64,
+    successful_txns: u64,
+}
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -74,13 +89,44 @@ async fn run(net_handle: tokio::runtime::Handle) -> Result<()> {
     let start = Instant::now();
     let mut handles = Vec::with_capacity(test_data.len());
 
+    // Interval metrics collection
+    let metrics = Arc::new(IntervalMetrics {
+        latency_sum_us: AtomicU64::new(0),
+        op_count: AtomicU64::new(0),
+        success_count: AtomicU64::new(0),
+    });
+    let snapshots: Arc<Mutex<Vec<Snapshot>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let collector_metrics = metrics.clone();
+    let collector_snapshots = snapshots.clone();
+    let collector_start = start;
+    let collector_handle = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(COLLECT_INTERVAL).await;
+            let lat_sum = collector_metrics.latency_sum_us.swap(0, Ordering::Relaxed);
+            let count = collector_metrics.op_count.swap(0, Ordering::Relaxed);
+            let success = collector_metrics.success_count.swap(0, Ordering::Relaxed);
+            let avg_lat = if count > 0 {
+                lat_sum as f64 / count as f64 / 1000.0
+            } else {
+                0.0
+            };
+            collector_snapshots.lock().await.push(Snapshot {
+                elapsed_secs: collector_start.elapsed().as_secs_f64(),
+                avg_latency_ms: avg_lat,
+                successful_txns: success,
+            });
+        }
+    });
+
     for i in 0..test_data.len() {
         print_progress(i, test_data.len());
         let operation = test_data[i];
         let sender = sender.clone();
+        let m = metrics.clone();
         handles.push(tokio::spawn(async move {
             let req_start = Instant::now();
-            match operation {
+            let success = match operation {
                 Operation::Get { key } => {
                     let (response_sender, response_receiver) = oneshot::channel();
                     let message = LocalMessage::Get {
@@ -90,13 +136,13 @@ async fn run(net_handle: tokio::runtime::Handle) -> Result<()> {
 
                     if let Err(e) = sender.send(message).await {
                         error!("Error sending operation {:?}: {e}", operation);
-                    }
-                    if let Err(e) = response_receiver.await {
+                    } else if let Err(e) = response_receiver.await {
                         error!(
                             "Error receiving response for operation {:?}: {e}",
                             operation
                         );
                     }
+                    true
                 }
                 Operation::Put { pair } => {
                     let (response_sender, response_receiver) = oneshot::channel();
@@ -107,12 +153,18 @@ async fn run(net_handle: tokio::runtime::Handle) -> Result<()> {
 
                     if let Err(e) = sender.send(message).await {
                         error!("Error sending operation {:?}: {e}", operation);
-                    }
-                    if let Err(e) = response_receiver.await {
-                        error!(
-                            "Error receiving response for operation {:?}: {e}",
-                            operation
-                        );
+                        false
+                    } else {
+                        match response_receiver.await {
+                            Ok(result) => result,
+                            Err(e) => {
+                                error!(
+                                    "Error receiving response for operation {:?}: {e}",
+                                    operation
+                                );
+                                false
+                            }
+                        }
                     }
                 }
                 Operation::TriPut { pairs } => {
@@ -126,19 +178,32 @@ async fn run(net_handle: tokio::runtime::Handle) -> Result<()> {
 
                     if let Err(e) = sender.send(message).await {
                         error!("Error sending operation {:?}: {e}", operation);
+                        false
+                    } else {
+                        let result = match response_receiver.await {
+                            Ok(result) => result,
+                            Err(e) => {
+                                error!(
+                                    "Error receiving response for operation {:?}: {e}",
+                                    operation
+                                );
+                                false
+                            }
+                        };
+                        let tri_end_ms = tri_start.elapsed().as_millis();
+                        info!("TriPut took {}ms", tri_end_ms);
+                        result
                     }
-                    if let Err(e) = response_receiver.await {
-                        error!(
-                            "Error receiving response for operation {:?}: {e}",
-                            operation
-                        );
-                    }
-                    let tri_end_ms = tri_start.elapsed().as_millis();
-                    info!("TriPut took {}ms", tri_end_ms);
                 }
-            }
+            };
 
-            req_start.elapsed()
+            let latency = req_start.elapsed();
+            m.latency_sum_us.fetch_add(latency.as_micros() as u64, Ordering::Relaxed);
+            m.op_count.fetch_add(1, Ordering::Relaxed);
+            if success {
+                m.success_count.fetch_add(1, Ordering::Relaxed);
+            }
+            latency
         }));
     }
 
@@ -148,6 +213,21 @@ async fn run(net_handle: tokio::runtime::Handle) -> Result<()> {
         latencies.push(handle.await?);
     }
     let elapsed = start.elapsed();
+
+    // Stop collector and print interval data
+    collector_handle.abort();
+    let _ = collector_handle.await;
+
+    let snaps = snapshots.lock().await;
+    info!("=== Interval Metrics ({}s intervals) ===", COLLECT_INTERVAL.as_secs());
+    info!("{:<12} {:>20} {:>20}", "Time(s)", "Successful Txns", "Avg Latency(ms)");
+    for snap in snaps.iter() {
+        info!(
+            "{:<12.1} {:>20} {:>20.3}",
+            snap.elapsed_secs, snap.successful_txns, snap.avg_latency_ms
+        );
+    }
+    drop(snaps);
 
     // Signal peers we're done
     sender.send(LocalMessage::Done).await?;

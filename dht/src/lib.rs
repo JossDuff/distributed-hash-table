@@ -63,13 +63,9 @@ pub(crate) struct PendingTx<K: Clone, V: Clone> {
 
 /// Tracks Accepted messages for a transaction so every participant can
 /// independently determine the commit/abort outcome (Faster Paxos-Commit).
-pub(crate) struct TxVoteTracker<K: Clone, V: Clone> {
+pub(crate) struct TxVoteTracker {
     // For each RM: (acceptors that confirmed Prepared, acceptors that confirmed Aborted)
     pub(crate) rm_votes: Mutex<HashMap<NodeId, (HashSet<NodeId>, HashSet<NodeId>)>>,
-    pub(crate) all_rms: HashSet<NodeId>,
-    pub(crate) key_replicas: Vec<(K, Vec<NodeId>)>,
-    pub(crate) pairs: Vec<KVPair<K, V>>,
-    pub(crate) version: u64,
     pub(crate) notify: Notify,
 }
 
@@ -86,7 +82,7 @@ pub(crate) struct Shared<K: Clone, V: Clone> {
     pub(crate) awaiting_quorum_get: Arc<Mutex<HashMap<u64, mpsc::Sender<(Option<V>, u64)>>>>,
     // Paxos-Commit: acceptor log and transaction vote trackers
     pub(crate) acceptor_log: Arc<Mutex<HashMap<(u64, NodeId), bool>>>,
-    pub(crate) tx_trackers: Arc<Mutex<HashMap<u64, Arc<TxVoteTracker<K, V>>>>>,
+    pub(crate) tx_trackers: Arc<Mutex<HashMap<u64, Arc<TxVoteTracker>>>>,
     pub(crate) pending_prepares: Arc<Mutex<HashMap<u64, PendingTx<K, V>>>>,
     // Crash detection
     pub(crate) alive_nodes: Arc<Mutex<HashSet<NodeId>>>,
@@ -213,7 +209,7 @@ where
             Arc::new(Mutex::new(HashMap::new()));
         let acceptor_log: Arc<Mutex<HashMap<(u64, NodeId), bool>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let tx_trackers: Arc<Mutex<HashMap<u64, Arc<TxVoteTracker<K, V>>>>> =
+        let tx_trackers: Arc<Mutex<HashMap<u64, Arc<TxVoteTracker>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
         // this is a barrier

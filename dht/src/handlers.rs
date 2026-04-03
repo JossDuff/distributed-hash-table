@@ -154,14 +154,6 @@ pub(crate) async fn handle_local_write<K, V>(
     // 2. Create TxVoteTracker inline (before spawning, so peer loop sees it)
     let tracker = Arc::new(TxVoteTracker {
         rm_votes: Mutex::new(HashMap::new()),
-        all_rms: all_rms.clone(),
-        key_replicas: key_replica_vecs
-            .iter()
-            .zip(pairs.iter())
-            .map(|(replicas, pair)| (pair.key, replicas.clone()))
-            .collect(),
-        pairs: pairs.clone(),
-        version,
         notify: Notify::new(),
     });
     s.tx_trackers.lock().await.insert(tx_id, tracker.clone());
@@ -392,22 +384,9 @@ pub(crate) async fn handle_peer_prepare<K, V>(
         .iter()
         .map(|p| s.get_key_replicas(&p.key).into_iter().cloned().collect())
         .collect();
-    let all_rms: HashSet<NodeId> = key_replica_vecs
-        .iter()
-        .flat_map(|r| r.iter().cloned())
-        .collect();
-
     // Create TxVoteTracker inline (before spawning, so peer loop sees it)
     let tracker = Arc::new(TxVoteTracker {
         rm_votes: Mutex::new(HashMap::new()),
-        all_rms,
-        key_replicas: key_replica_vecs
-            .iter()
-            .zip(pairs.iter())
-            .map(|(r, p)| (p.key, r.clone()))
-            .collect(),
-        pairs: pairs.clone(),
-        version,
         notify: Notify::new(),
     });
     s.tx_trackers.lock().await.insert(tx_id, tracker.clone());
