@@ -37,7 +37,7 @@ Commands:
   list                              List all nodes with their current CPU load
   run -n <num> [-- args...]         Run 'target/release/dht' on N least-loaded nodes
   exec -n <num> -- <command>        Run arbitrary command on N least-loaded nodes
-  kill [name]                       Kill processes on all nodes (default: 'dht')
+  cleanup                            Kill dht and dht-client on all nodes
 
 Options:
   -n <num>      Number of nodes to use (required for 'run' and 'exec')
@@ -62,8 +62,7 @@ Examples:
   sun.sh run -n 3 -- --extra-flag
   sun.sh exec -n 3 -- hostname
   sun.sh exec -n 5 -- "cd ~/dev/project && ./my_script.sh"
-  sun.sh kill                          Kill 'dht' on all nodes
-  sun.sh kill myapp                    Kill 'myapp' on all nodes
+  sun.sh cleanup                       Kill dht and dht-client on all nodes
 
 Logs are saved to: logs/<node>.log
 
@@ -113,19 +112,18 @@ get_sorted_nodes() {
     rm -f "$tmp_file"
 }
 
-# Kill my dht binary running on all machines
-cmd_kill() {
-    local binary_name="${1:-dht}"
-
-    echo -e "${GREEN}=== Killing '$binary_name' on all nodes ===${NC}"
+# Kill both dht and dht-client on all machines
+cmd_cleanup() {
+    echo -e "${GREEN}=== Killing dht and dht-client on all nodes ===${NC}"
     echo ""
 
     for node in "${ALL_NODES[@]}"; do
         local host="${node}.${DOMAIN}"
         result=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 -o BatchMode=yes \
-            "${USERNAME}@${host}" "pkill -u $USERNAME -x $binary_name && echo 'killed' || echo 'none'" 2>/dev/null)
-        if [[ "$result" == "killed" ]]; then
-            echo -e "${YELLOW}[$node]${NC} killed $binary_name"
+            "${USERNAME}@${host}" "pkill -u $USERNAME -x dht 2>/dev/null && echo -n 'node '; pkill -u $USERNAME -x dht-client 2>/dev/null && echo -n 'client '; echo" 2>/dev/null)
+        result=$(echo "$result" | xargs)
+        if [[ -n "$result" ]]; then
+            echo -e "${YELLOW}[$node]${NC} killed: $result"
         fi
     done &
     wait
@@ -578,8 +576,8 @@ exec)
     fi
     cmd_exec "$NUM_NODES" $EXTRA_ARGS
     ;;
-kill)
-    cmd_kill "${EXTRA_ARGS:-dht}"
+cleanup)
+    cmd_cleanup
     ;;
 -h | --help)
     usage
