@@ -356,7 +356,7 @@ cmd_run() {
         for node in "${nodes[@]}"; do
             local host="${node}.${DOMAIN}"
             ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
-                "${USERNAME}@${host}" "pkill -u $USERNAME -x dht; pkill -u $USERNAME dht-client" 2>/dev/null
+                "${USERNAME}@${host}" "pkill -u $USERNAME -x dht; pkill -u $USERNAME -x dht-client" 2>/dev/null
         done
 
         echo ""
@@ -369,7 +369,8 @@ cmd_run() {
 
     for node in "${nodes[@]}"; do
         local host="${node}.${DOMAIN}"
-        local log_file="$LOG_DIR/${node}.log"
+        local node_log="$LOG_DIR/${node}-node.log"
+        local client_log="$LOG_DIR/${node}-client.log"
         local connections
         connections=$(get_connections "$node" "${nodes[@]}")
 
@@ -394,16 +395,21 @@ cmd_run() {
             client_cmd="$client_cmd --key-range $key_range"
         fi
 
-        # Combined: build, start node in background, wait, then start client in foreground
-        local cmd="cd $project_dir && cargo build --release --quiet --target-dir $TARGET_DIR && export RUST_LOG=$rust_log && $node_cmd & sleep 2 && $client_cmd"
-
         echo -e "${YELLOW}[$node]${NC} starting node + client (connects to: $connections)"
 
+        # Start node in one SSH session, client in another, with separate log files
         ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-            "${USERNAME}@${host}" "$cmd" \
-            >"$log_file" 2>&1 &
+            "${USERNAME}@${host}" \
+            "cd $project_dir && cargo build --release --quiet --target-dir $TARGET_DIR && export RUST_LOG=$rust_log && exec $node_cmd" \
+            >"$node_log" 2>&1 &
+        PIDS["${node}-node"]=$!
 
-        PIDS[$node]=$!
+        # Client SSH: wait for node to start, then run client
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+            "${USERNAME}@${host}" \
+            "export RUST_LOG=$rust_log && sleep 2 && $client_cmd" \
+            >"$client_log" 2>&1 &
+        PIDS["${node}-client"]=$!
     done
 
     echo ""
