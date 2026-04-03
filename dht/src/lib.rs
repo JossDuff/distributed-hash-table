@@ -303,8 +303,10 @@ where
     V: Send + Sync + 'static + Debug + Serialize + for<'de> Deserialize<'de> + Clone,
 {
     let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut diag_counter: u32 = 0;
     loop {
         interval.tick().await;
+        diag_counter += 1;
 
         // Send Ping to all alive peers
         let alive: Vec<NodeId> = {
@@ -335,6 +337,20 @@ where
         for node in &dead {
             info!("Heartbeat: {} timed out, marking as dead", node);
             s.mark_node_done(node).await;
+        }
+
+        // Periodic diagnostic: every 10 heartbeats (1 second)
+        if diag_counter % 10 == 0 {
+            let pending_count = s.pending_prepares.lock().await.len();
+            let tracker_count = s.tx_trackers.lock().await.len();
+            let awaiting_count = s.awaiting_quorum_get.lock().await.len();
+            let log_count = s.acceptor_log.lock().await.len();
+            if pending_count > 0 || tracker_count > 0 || awaiting_count > 0 {
+                debug!(
+                    "DIAG: pending_prepares={}, tx_trackers={}, awaiting_quorum_get={}, acceptor_log={}",
+                    pending_count, tracker_count, awaiting_count, log_count
+                );
+            }
         }
     }
 }

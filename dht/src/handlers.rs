@@ -53,34 +53,43 @@ where
     let s = s.clone();
     let is_local_replica = alive_replicas.contains(&s.my_node_id);
     tokio::spawn(async move {
+        debug!("get req {}: spawned, key={:?}, replicas={}, local={}", req_id, key, alive_replicas.len(), is_local_replica);
         // Send QuorumGet to remotes FIRST (non-blocking), then do local read
         for replica in &alive_replicas {
             if *replica != s.my_node_id {
                 s.send_to_peer(replica, PeerMessage::QuorumGet { key, req_id });
             }
         }
+        debug!("get req {}: sent remote QuorumGets", req_id);
 
         // Local read (may block on stripe lock, so do it after remote sends)
         if is_local_replica {
+            debug!("get req {}: starting local db.get, stripe={}", req_id, s.db.stripe_index(&key));
             let (val, version) = match s.db.get(&key).await {
                 Some((v, ver)) => (Some(v), ver),
                 None => (None, 0),
             };
+            debug!("get req {}: local db.get done, version={}", req_id, version);
             let _ = resp_tx.try_send((val, version));
         }
 
+        debug!("get req {}: entering response collection", req_id);
         // Collect quorum responses with timeout
         let mut responses = Vec::new();
         let _ = tokio::time::timeout(QUORUM_READ_TIMEOUT, async {
             while responses.len() < quorum {
                 match resp_rx.recv().await {
-                    Some(resp) => responses.push(resp),
+                    Some(resp) => {
+                        debug!("get req {}: got response #{}", req_id, responses.len() + 1);
+                        responses.push(resp);
+                    }
                     None => break,
                 }
             }
         })
         .await;
 
+        debug!("get req {}: collection done, got {} responses (need {})", req_id, responses.len(), quorum);
         s.awaiting_quorum_get.lock().await.remove(&req_id);
         let result = if responses.len() >= quorum {
             paxos_commit::select_best_read(&responses)
@@ -227,6 +236,9 @@ pub(crate) async fn handle_local_write<K, V>(
                         version,
                     },
                 );
+            } else {
+                // Drop partially-acquired guards immediately to avoid self-deadlock
+                drop(guards);
             }
 
             // Self-accept + broadcast Vote + Accepted
@@ -316,11 +328,13 @@ pub(crate) async fn handle_local_write<K, V>(
                 // Apply writes from locked guards
                 let mut pending = s.pending_prepares.lock().await;
                 if let Some(mut tx) = pending.remove(&tx_id) {
+                    let stripes: Vec<usize> = tx.pairs.iter().map(|(_, idx)| *idx).collect();
                     for (pair, stripe_idx) in &tx.pairs {
                         if let Some(guard) = tx.guards.get_mut(stripe_idx) {
                             guard.insert(pair.key, (pair.val.clone(), tx.version));
                         }
                     }
+                    debug!("local_write tx {}: released stripe locks {:?}", tx_id, stripes);
                 }
             } else if is_local_rm {
                 // Voted Aborted but tx committed: apply via db.put()
@@ -332,7 +346,11 @@ pub(crate) async fn handle_local_write<K, V>(
         } else {
             debug!("local_write tx {}: aborted", tx_id);
             // Drop guards (release locks)
-            s.pending_prepares.lock().await.remove(&tx_id);
+            let mut pending = s.pending_prepares.lock().await;
+            if let Some(tx) = pending.remove(&tx_id) {
+                let stripes: Vec<usize> = tx.pairs.iter().map(|(_, idx)| *idx).collect();
+                debug!("local_write tx {}: releasing stripe locks {:?}", tx_id, stripes);
+            }
         }
 
         // Clean up
@@ -341,6 +359,7 @@ pub(crate) async fn handle_local_write<K, V>(
             let mut log = s.acceptor_log.lock().await;
             log.retain(|k, _| k.0 != tx_id);
         }
+        debug!("local_write tx {}: cleanup done", tx_id);
 
         let _ = response_sender.send(committed);
     });
@@ -453,6 +472,11 @@ pub(crate) async fn handle_peer_prepare<K, V>(
                     version,
                 },
             );
+        } else {
+            // Drop partially-acquired guards immediately to avoid self-deadlock:
+            // if the tx later commits, the "apply via db.put()" path would
+            // lock().await on stripes we still hold → deadlock.
+            drop(guards);
         }
 
         // Self-accept + broadcast Vote + Accepted
@@ -535,11 +559,13 @@ pub(crate) async fn handle_peer_prepare<K, V>(
                 // Apply writes from locked guards
                 let mut pending = s.pending_prepares.lock().await;
                 if let Some(mut tx) = pending.remove(&tx_id) {
+                    let stripes: Vec<usize> = tx.pairs.iter().map(|(_, idx)| *idx).collect();
                     for (pair, stripe_idx) in &tx.pairs {
                         if let Some(guard) = tx.guards.get_mut(stripe_idx) {
                             guard.insert(pair.key, (pair.val.clone(), tx.version));
                         }
                     }
+                    debug!("peer_prepare tx {}: released stripe locks {:?}", tx_id, stripes);
                 }
             } else {
                 // Voted Aborted but tx committed: apply via db.put()
@@ -551,7 +577,11 @@ pub(crate) async fn handle_peer_prepare<K, V>(
         } else {
             debug!("peer_prepare tx {}: aborted", tx_id);
             // Drop guards (release locks)
-            s.pending_prepares.lock().await.remove(&tx_id);
+            let mut pending = s.pending_prepares.lock().await;
+            if let Some(tx) = pending.remove(&tx_id) {
+                let stripes: Vec<usize> = tx.pairs.iter().map(|(_, idx)| *idx).collect();
+                debug!("peer_prepare tx {}: releasing stripe locks {:?}", tx_id, stripes);
+            }
         }
 
         // Clean up
@@ -560,5 +590,6 @@ pub(crate) async fn handle_peer_prepare<K, V>(
             let mut log = s.acceptor_log.lock().await;
             log.retain(|k, _| k.0 != tx_id);
         }
+        debug!("peer_prepare tx {}: cleanup done", tx_id);
     });
 }
