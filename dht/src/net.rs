@@ -100,7 +100,7 @@ where
     info!("[{}] Listening on {}", my_name, listen_addr);
 
     // Channel for completed peer connections (from both accept and connect paths)
-    let (conn_sender, mut conn_receiver) = mpsc::channel::<(NodeId, TcpStream)>(64);
+    let (conn_sender, mut conn_receiver) = mpsc::channel::<(NodeId, TcpStream)>(128);
     // Channel for client connections
     let (client_sender, client_receiver) = mpsc::channel::<TcpStream>(16);
 
@@ -193,7 +193,7 @@ where
     info!("[{}] All {} peers connected", my_name, streams.len());
 
     // Now split each stream into reader/writer tasks with channels
-    let (inbox_sender, inbox_receiver) = mpsc::channel::<(NodeId, PeerMessage<K, V>)>(256);
+    let (inbox_sender, inbox_receiver) = mpsc::channel::<(NodeId, PeerMessage<K, V>)>(2048);
     let mut senders = HashMap::new();
     // list of all nodes in the cluster
     let mut cluster: Vec<NodeId> = streams.keys().cloned().collect();
@@ -204,7 +204,7 @@ where
 
     for (peer_id, stream) in streams {
         let (read_half, write_half) = stream.into_split();
-        let (outbox_sender, outbox_receiver) = mpsc::channel::<PeerMessage<K, V>>(64);
+        let (outbox_sender, outbox_receiver) = mpsc::channel::<PeerMessage<K, V>>(512);
 
         // Reader task: recv from socket -> inbox
         let inbox_sender = inbox_sender.clone();

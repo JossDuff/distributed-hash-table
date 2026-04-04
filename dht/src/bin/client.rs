@@ -1,22 +1,22 @@
 use anyhow::Result;
 use clap::Parser;
 use dht::{
-    ClientHello, ClientMessage, ClientResponse, FirstMessage, KVPair,
-    get_connect_str, recv_msg, send_msg,
+    get_connect_str, recv_msg, send_msg, ClientHello, ClientMessage, ClientResponse, FirstMessage,
+    KVPair,
 };
 use rand::{rngs::ThreadRng, Rng};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::TcpStream;
 use tokio::sync::{oneshot, Mutex, Notify, Semaphore};
 use tracing::{debug, error, info};
 
 const PUT_FREQUENCY: usize = 20;
 const TRI_PUT_FREQUENCY: usize = 20;
-const COLLECT_INTERVAL: Duration = Duration::from_millis(500);
+const COLLECT_INTERVAL: Duration = Duration::from_millis(1000);
 const MAX_IN_FLIGHT: usize = 64;
 const MAX_RETRIES: usize = 10;
 
@@ -90,8 +90,16 @@ async fn run() -> Result<()> {
     // Connect to co-located node
     let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
     let disconnect = Arc::new(Notify::new());
+    let done = Arc::new(AtomicBool::new(false));
 
-    let (writer, _reader_handle) = connect_to_node(&config.name, &config.name, pending.clone(), disconnect.clone()).await?;
+    let (writer, _reader_handle) = connect_to_node(
+        &config.name,
+        &config.name,
+        pending.clone(),
+        disconnect.clone(),
+        done.clone(),
+    )
+    .await?;
 
     let conn_state = Arc::new(Mutex::new(ConnectionState {
         writers: vec![writer],
@@ -128,13 +136,9 @@ async fn run() -> Result<()> {
     let collector_handle = tokio::spawn(async move {
         loop {
             tokio::time::sleep(COLLECT_INTERVAL).await;
-            let lat_sum = collector_metrics
-                .latency_sum_us
-                .swap(0, Ordering::Relaxed);
+            let lat_sum = collector_metrics.latency_sum_us.swap(0, Ordering::Relaxed);
             let count = collector_metrics.op_count.swap(0, Ordering::Relaxed);
-            let success = collector_metrics
-                .success_count
-                .swap(0, Ordering::Relaxed);
+            let success = collector_metrics.success_count.swap(0, Ordering::Relaxed);
             let avg_lat = if count > 0 {
                 lat_sum as f64 / count as f64 / 1000.0
             } else {
@@ -200,17 +204,13 @@ async fn run() -> Result<()> {
                                     pair.key, attempts
                                 );
                                 drop(permit);
-                                let backoff =
-                                    Duration::from_millis(10 * (1 << attempts.min(5)))
-                                        + Duration::from_millis(rand::random_range(0..20));
+                                let backoff = Duration::from_millis(10 * (1 << attempts.min(5)))
+                                    + Duration::from_millis(rand::random_range(0..20));
                                 tokio::time::sleep(backoff).await;
                                 permit = sem.acquire().await.unwrap();
                             }
                             Ok(false) => {
-                                debug!(
-                                    "Put {:?} failed after {} attempts",
-                                    pair.key, attempts
-                                );
+                                debug!("Put {:?} failed after {} attempts", pair.key, attempts);
                                 m.max_retries_hit.fetch_add(1, Ordering::Relaxed);
                                 break false;
                             }
@@ -237,9 +237,8 @@ async fn run() -> Result<()> {
                             Ok(false) if attempts < MAX_RETRIES => {
                                 debug!("TriPut failed (attempt {}), retrying", attempts);
                                 drop(permit);
-                                let backoff =
-                                    Duration::from_millis(10 * (1 << attempts.min(5)))
-                                        + Duration::from_millis(rand::random_range(0..20));
+                                let backoff = Duration::from_millis(10 * (1 << attempts.min(5)))
+                                    + Duration::from_millis(rand::random_range(0..20));
                                 tokio::time::sleep(backoff).await;
                                 permit = sem.acquire().await.unwrap();
                             }
@@ -295,6 +294,7 @@ async fn run() -> Result<()> {
     drop(snaps);
 
     // Send Done to home node (if still connected, i.e., not in failover mode)
+    done.store(true, Ordering::Relaxed);
     {
         let state = conn_state.lock().await;
         if !state.failed_over {
@@ -332,6 +332,7 @@ async fn connect_to_node(
     client_name: &str,
     pending: PendingMap,
     disconnect: Arc<Notify>,
+    done: Arc<AtomicBool>,
 ) -> Result<(Arc<Mutex<OwnedWriteHalf>>, tokio::task::JoinHandle<()>)> {
     let addr = get_connect_str(node_name);
     info!("Connecting to {} at {}", node_name, addr);
@@ -353,7 +354,13 @@ async fn connect_to_node(
     let (read_half, write_half) = stream.into_split();
     let writer = Arc::new(Mutex::new(write_half));
 
-    let reader_handle = tokio::spawn(client_reader_task(node_name.to_string(), read_half, pending, disconnect));
+    let reader_handle = tokio::spawn(client_reader_task(
+        node_name.to_string(),
+        read_half,
+        pending,
+        disconnect,
+        done,
+    ));
 
     Ok((writer, reader_handle))
 }
@@ -364,6 +371,7 @@ async fn client_reader_task(
     mut read_half: OwnedReadHalf,
     pending: PendingMap,
     disconnect: Arc<Notify>,
+    done: Arc<AtomicBool>,
 ) {
     loop {
         match recv_msg::<ClientResponse<u8>, _>(&mut read_half).await {
@@ -377,8 +385,18 @@ async fn client_reader_task(
                 }
             }
             Err(_) => {
-                info!("Node '{}' died — connection lost, triggering failover", node_name);
-                disconnect.notify_waiters();
+                if done.load(Ordering::Relaxed) {
+                    debug!(
+                        "Connection to node '{}' closed (normal shutdown)",
+                        node_name
+                    );
+                } else {
+                    info!(
+                        "Node '{}' died — connection lost, triggering failover",
+                        node_name
+                    );
+                    disconnect.notify_waiters();
+                }
                 break;
             }
         }
@@ -415,12 +433,15 @@ async fn failover(
     let new_disconnect = Arc::new(Notify::new());
     let mut new_writers = Vec::new();
 
+    let new_done = Arc::new(AtomicBool::new(false));
+
     for node_name in connections {
         match connect_to_node(
             node_name,
             home_name,
             new_pending.clone(),
             new_disconnect.clone(),
+            new_done.clone(),
         )
         .await
         {
