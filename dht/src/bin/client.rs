@@ -219,8 +219,6 @@ async fn run() -> Result<()> {
                     }
                 }
                 Operation::TriPut { pairs } => {
-                    info!("Starting TriPut");
-                    let tri_start = Instant::now();
                     let mut attempts = 0;
                     let result = loop {
                         attempts += 1;
@@ -253,8 +251,6 @@ async fn run() -> Result<()> {
                             Err(_) => break false,
                         }
                     };
-                    let tri_end_ms = tri_start.elapsed().as_millis();
-                    info!("TriPut took {}ms", tri_end_ms);
                     result
                 }
             };
