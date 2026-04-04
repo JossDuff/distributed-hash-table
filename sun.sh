@@ -397,17 +397,17 @@ cmd_run() {
 
         echo -e "${YELLOW}[$node]${NC} starting node + client (connects to: $connections)"
 
-        # Node SSH: streams directly to local log file
+        # Node SSH: build to scratch, then run node
         ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
             "${USERNAME}@${host}" \
-            "export RUST_LOG=$rust_log && exec $node_cmd" \
+            "cd $project_dir && cargo build --release --quiet --target-dir $TARGET_DIR && export RUST_LOG=$rust_log && exec $node_cmd" \
             >"$node_log" 2>&1 &
         PIDS["${node}-node"]=$!
 
-        # Client SSH: wait for node to start, then run client
+        # Client SSH: build (waits for cargo lock), then run client
         ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
             "${USERNAME}@${host}" \
-            "export RUST_LOG=$rust_log && sleep 2 && exec $client_cmd" \
+            "cd $project_dir && cargo build --release --quiet --target-dir $TARGET_DIR && export RUST_LOG=$rust_log && sleep 2 && exec $client_cmd" \
             >"$client_log" 2>&1 &
         PIDS["${node}-client"]=$!
     done
