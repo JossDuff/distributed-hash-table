@@ -302,8 +302,8 @@ cmd_run() {
     echo -e "${GREEN}=== Running on Cluster ===${NC}"
     echo ""
 
-    echo -e "${CYAN}Building project to populate cargo cache...${NC}"
-    (cd "$project_dir" && cargo build --release --quiet)
+    echo -e "${CYAN}Building project...${NC}"
+    (cd "$project_dir" && cargo build --release --quiet --target-dir $TARGET_DIR)
     echo -e "${GREEN}Build complete${NC}"
     echo ""
 
@@ -397,19 +397,14 @@ cmd_run() {
 
         echo -e "${YELLOW}[$node]${NC} starting node + client (connects to: $connections)"
 
-        # Start node in one SSH session, client in another, with separate log files
+        # Single SSH session: build once, redirect node and client logs to separate remote files
+        local remote_node_log="/tmp/dht-${node}-node.log"
+        local remote_client_log="/tmp/dht-${node}-client.log"
         ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
             "${USERNAME}@${host}" \
-            "cd $project_dir && cargo build --release --quiet --target-dir $TARGET_DIR && export RUST_LOG=$rust_log && exec $node_cmd" \
-            >"$node_log" 2>&1 &
-        PIDS["${node}-node"]=$!
-
-        # Client SSH: wait for node to start, then run client
-        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-            "${USERNAME}@${host}" \
-            "export RUST_LOG=$rust_log && sleep 2 && $client_cmd" \
-            >"$client_log" 2>&1 &
-        PIDS["${node}-client"]=$!
+            "cd $project_dir && export RUST_LOG=$rust_log && $node_cmd >$remote_node_log 2>&1 & sleep 2 && $client_cmd >$remote_client_log 2>&1; wait" \
+            >/dev/null 2>&1 &
+        PIDS[$node]=$!
     done
 
     echo ""
@@ -447,6 +442,18 @@ cmd_run() {
         kill "$KILL_PID" 2>/dev/null
         wait "$KILL_PID" 2>/dev/null
     fi
+
+    # Fetch remote log files
+    echo ""
+    echo -e "${CYAN}Fetching logs from nodes...${NC}"
+    for node in "${nodes[@]}"; do
+        local host="${node}.${DOMAIN}"
+        scp -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
+            "${USERNAME}@${host}:/tmp/dht-${node}-node.log" "$LOG_DIR/${node}-node.log" 2>/dev/null &
+        scp -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
+            "${USERNAME}@${host}:/tmp/dht-${node}-client.log" "$LOG_DIR/${node}-client.log" 2>/dev/null &
+    done
+    wait
 
     echo ""
     echo -e "${GREEN}=== Run Complete ===${NC}"
