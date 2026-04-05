@@ -30,7 +30,7 @@ use tokio::sync::OwnedMutexGuard;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{debug, info};
 
-const CHANNEL_BUFFER_SIZE: usize = 16384;
+const CHANNEL_BUFFER_SIZE: usize = 512;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(500);
 pub(crate) const VOTE_LEARN_TIMEOUT: Duration = Duration::from_millis(500);
