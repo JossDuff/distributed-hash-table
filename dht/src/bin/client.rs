@@ -46,12 +46,6 @@ struct IntervalMetrics {
     max_retries_hit: AtomicU64,
 }
 
-struct Snapshot {
-    elapsed_secs: f64,
-    avg_latency_ms: f64,
-    successful_txns: u64,
-}
-
 // Pending response map: req_id -> oneshot sender for the response
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<ClientResponse<u8>>>>>;
 
@@ -181,7 +175,8 @@ async fn run() -> Result<()> {
             let success = match operation {
                 Operation::Get { key } => {
                     let req_id = req_ctr.fetch_add(1, Ordering::Relaxed);
-                    send_and_receive_get(key, req_id, &conn, &rr, &all_connections, &home_name).await
+                    send_and_receive_get(key, req_id, &conn, &rr, &all_connections, &home_name)
+                        .await
                 }
                 Operation::Put { pair } => {
                     let mut attempts = 0;

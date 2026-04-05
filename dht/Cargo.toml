@@ -12,7 +12,6 @@ name = "dht-client"
 path = "src/bin/client.rs"
 
 [dependencies]
-paxos-commit = { path = "../paxos-commit" }
 
 anyhow = "1.0.100"
 bincode = "1.3"

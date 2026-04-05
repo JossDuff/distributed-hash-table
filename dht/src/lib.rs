@@ -1,9 +1,9 @@
-//use paxos_commit::whatever;
 mod config;
 mod db;
 mod handlers;
 mod messages;
 mod net;
+mod paxos_commit;
 
 use anyhow::Result;
 pub use config::Config;

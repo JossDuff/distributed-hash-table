@@ -1,18 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
-// Acceptor quorum: majority of ALL nodes in the cluster.
-// With N acceptors, tolerates floor((N-1)/2) crashes.
-pub fn acceptor_quorum(cluster_size: usize) -> usize {
-    cluster_size / 2 + 1
-}
-
-// Replica quorum: majority of a key's replicas.
-// With R replicas, need R/2+1 Prepared votes for a key's write to succeed.
-pub fn replica_quorum(replication_degree: usize) -> usize {
-    replication_degree / 2 + 1
-}
-
 // Status of an individual RM's vote as seen by a learner.
 enum VoteStatus {
     // acceptor_quorum acceptors confirmed Prepared
@@ -123,6 +111,18 @@ pub fn select_best_read<V: Clone>(responses: &[(Option<V>, u64)]) -> Option<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Acceptor quorum: majority of ALL nodes in the cluster.
+    // With N acceptors, tolerates floor((N-1)/2) crashes.
+    pub fn acceptor_quorum(cluster_size: usize) -> usize {
+        cluster_size / 2 + 1
+    }
+
+    // Replica quorum: majority of a key's replicas.
+    // With R replicas, need R/2+1 Prepared votes for a key's write to succeed.
+    pub fn replica_quorum(replication_degree: usize) -> usize {
+        replication_degree / 2 + 1
+    }
 
     // --- Quorum size tests ---
 
@@ -314,11 +314,7 @@ mod tests {
 
     #[test]
     fn best_read_with_nones() {
-        let responses = vec![
-            (None, 0),
-            (Some("val".to_string()), 1),
-            (None, 0),
-        ];
+        let responses = vec![(None, 0), (Some("val".to_string()), 1), (None, 0)];
         assert_eq!(select_best_read(&responses), Some("val".to_string()));
     }
 
