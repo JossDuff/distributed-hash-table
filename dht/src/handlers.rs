@@ -265,18 +265,19 @@ pub(crate) async fn handle_local_write<K, V>(
                 .lock()
                 .await
                 .insert((tx_id, my_node_id.clone()), vote);
+            let alive = s.alive_nodes.lock().await.clone();
             for (node_id, sender) in s.senders.iter() {
-                if *node_id != my_node_id {
-                    let _ = sender.try_send(PeerMessage::Vote {
+                if *node_id != my_node_id && alive.contains(node_id) {
+                    let _ = sender.send(PeerMessage::Vote {
                         tx_id,
                         rm_id: my_node_id.clone(),
                         vote,
-                    });
-                    let _ = sender.try_send(PeerMessage::Accepted {
+                    }).await;
+                    let _ = sender.send(PeerMessage::Accepted {
                         tx_id,
                         rm_id: my_node_id.clone(),
                         vote,
-                    });
+                    }).await;
                 }
             }
 
@@ -510,18 +511,19 @@ pub(crate) async fn handle_peer_prepare<K, V>(
             "peer_prepare tx {}: broadcasting Vote(vote={})",
             tx_id, vote
         );
+        let alive = s.alive_nodes.lock().await.clone();
         for (node_id, sender) in s.senders.iter() {
-            if *node_id != my_node_id {
-                let _ = sender.try_send(PeerMessage::Vote {
+            if *node_id != my_node_id && alive.contains(node_id) {
+                let _ = sender.send(PeerMessage::Vote {
                     tx_id,
                     rm_id: my_node_id.clone(),
                     vote,
-                });
-                let _ = sender.try_send(PeerMessage::Accepted {
+                }).await;
+                let _ = sender.send(PeerMessage::Accepted {
                     tx_id,
                     rm_id: my_node_id.clone(),
                     vote,
-                });
+                }).await;
             }
         }
 

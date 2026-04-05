@@ -600,13 +600,14 @@ where
                         rm_id, vote, tx_id
                     );
                     let my_node_id = s.my_node_id.clone();
+                    let alive = s.alive_nodes.lock().await.clone();
                     for (node_id, sender) in s.senders.iter() {
-                        if *node_id != my_node_id {
-                            let _ = sender.try_send(PeerMessage::Accepted {
+                        if *node_id != my_node_id && alive.contains(node_id) {
+                            let _ = sender.send(PeerMessage::Accepted {
                                 tx_id,
                                 rm_id: rm_id.clone(),
                                 vote,
-                            });
+                            }).await;
                         }
                     }
 
