@@ -21,7 +21,7 @@ use std::{
     fmt::{self, Debug},
     hash::{Hash, Hasher},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -92,8 +92,8 @@ pub(crate) struct Shared<K: Clone, V: Clone> {
     // Crash detection
     pub(crate) alive_nodes: Arc<Mutex<HashSet<NodeId>>>,
     pub(crate) last_pong: Arc<Mutex<HashMap<NodeId, Instant>>>,
-    pub(crate) done_count: AtomicUsize,
-    // signaled when done_count reaches cluster.len()
+    pub(crate) done_nodes: Arc<Mutex<HashSet<NodeId>>>,
+    // signaled when done_nodes.len() reaches cluster.len()
     pub(crate) shutdown: Notify,
 }
 
@@ -112,18 +112,25 @@ where
         + Copy,
     V: Send + Sync + 'static + Debug + Serialize + for<'de> Deserialize<'de> + Clone,
 {
-    /// Mark a node as done (finished tests or crashed).
-    /// Removes from alive_nodes and increments done_count.
-    /// Prevents double-counting (a node that crashes AND sends Done).
+    /// Mark a node as done (finished tests). Node stays alive to serve replicas.
+    /// Prevents double-counting via done_nodes set.
     pub(crate) async fn mark_node_done(&self, node: &NodeId) {
-        let mut alive = self.alive_nodes.lock().await;
-        if alive.remove(node) {
-            drop(alive);
-            let count = self.done_count.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut done = self.done_nodes.lock().await;
+        if done.insert(node.clone()) {
+            let count = done.len();
+            drop(done);
             if count >= self.cluster.len() {
                 self.shutdown.notify_waiters();
             }
         }
+    }
+
+    /// Mark a node as dead (crashed). Removes from alive_nodes AND counts as done.
+    pub(crate) async fn mark_node_dead(&self, node: &NodeId) {
+        let mut alive = self.alive_nodes.lock().await;
+        alive.remove(node);
+        drop(alive);
+        self.mark_node_done(node).await;
     }
 
     /// Acceptor quorum: majority of ALL nodes in cluster.
@@ -251,7 +258,7 @@ where
             tx_trackers,
             alive_nodes: Arc::new(Mutex::new(alive_nodes)),
             last_pong: Arc::new(Mutex::new(last_pong)),
-            done_count: AtomicUsize::new(0),
+            done_nodes: Arc::new(Mutex::new(HashSet::new())),
             shutdown: Notify::new(),
         });
 
@@ -443,7 +450,7 @@ where
         }
         for node in &dead {
             info!("Heartbeat: {} timed out, marking as dead", node);
-            s.mark_node_done(node).await;
+            s.mark_node_dead(node).await;
         }
 
         // Periodic diagnostic: every 10 heartbeats (1 second)
