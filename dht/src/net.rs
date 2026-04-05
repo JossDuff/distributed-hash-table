@@ -1,5 +1,6 @@
 use super::NodeId;
 use super::PeerMessage;
+use crate::messages::{FirstMessage, ReadyPeerMessage};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
@@ -12,9 +13,6 @@ use tracing::{error, info};
 
 const DOMAIN: &str = "cse.lehigh.edu";
 const PORT: u64 = 1895;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ReadyPeerMessage(NodeId);
 
 pub struct Peers<K: Clone, V: Clone> {
     pub inbox: mpsc::Receiver<(NodeId, PeerMessage<K, V>)>,
@@ -60,8 +58,7 @@ async fn reader_task<K, V>(
     }
 }
 
-// Handles serialization of the raw message
-async fn send_msg<M, W>(stream: &mut W, msg: &M) -> Result<()>
+pub async fn send_msg<M, W>(stream: &mut W, msg: &M) -> Result<()>
 where
     M: Serialize,
     W: AsyncWriteExt + Unpin,
@@ -73,8 +70,7 @@ where
     Ok(())
 }
 
-// handles deserialization of the raw message
-async fn recv_msg<M, R>(stream: &mut R) -> Result<M>
+pub async fn recv_msg<M, R>(stream: &mut R) -> Result<M>
 where
     M: for<'de> Deserialize<'de>,
     R: AsyncReadExt + Unpin,
@@ -94,7 +90,7 @@ pub async fn connect_all<K, V>(
     my_name: &str,
     sunlab_nodes: &Vec<String>,
     net_handle: &tokio::runtime::Handle,
-) -> Result<(Peers<K, V>, Vec<NodeId>, NodeId)>
+) -> Result<(Peers<K, V>, Vec<NodeId>, NodeId, mpsc::Receiver<TcpStream>)>
 where
     K: Serialize + for<'de> Deserialize<'de> + std::marker::Send + Sync + 'static + Clone,
     V: Serialize + for<'de> Deserialize<'de> + std::marker::Send + Sync + 'static + Clone,
@@ -103,10 +99,12 @@ where
     let listener = TcpListener::bind(&listen_addr).await?;
     info!("[{}] Listening on {}", my_name, listen_addr);
 
-    // Channel for completed connections (from both accept and connect paths)
-    let (conn_sender, mut conn_receiver) = mpsc::channel::<(NodeId, TcpStream)>(64);
+    // Channel for completed peer connections (from both accept and connect paths)
+    let (conn_sender, mut conn_receiver) = mpsc::channel::<(NodeId, TcpStream)>(128);
+    // Channel for client connections
+    let (client_sender, client_receiver) = mpsc::channel::<TcpStream>(16);
 
-    // Spawn acceptor task
+    // Spawn acceptor task — routes peers vs clients based on FirstMessage
     let accept_sender = conn_sender.clone();
     let my_name_owned = my_name.to_string();
     net_handle.spawn(async move {
@@ -115,16 +113,22 @@ where
                 Ok((mut stream, addr)) => {
                     let _ = stream.set_nodelay(true);
 
-                    // Expect Ready message to identify peer
-                    match recv_msg(&mut stream).await {
-                        Ok(ReadyPeerMessage(from)) => {
+                    match recv_msg::<FirstMessage, _>(&mut stream).await {
+                        Ok(FirstMessage::Peer(ReadyPeerMessage(from))) => {
                             info!(
-                                "[{}] Accepted connection from {} ({})",
+                                "[{}] Accepted peer connection from {} ({})",
                                 my_name_owned, from, addr
                             );
                             let _ = accept_sender.send((from, stream)).await;
                         }
-                        Err(e) => error!("Failed to read Ready: {}", e),
+                        Ok(FirstMessage::Client(hello)) => {
+                            info!(
+                                "[{}] Accepted client connection: {} ({})",
+                                my_name_owned, hello.client_name, addr
+                            );
+                            let _ = client_sender.send(stream).await;
+                        }
+                        Err(e) => error!("Failed to read handshake: {}", e),
                     }
                 }
                 Err(e) => error!("Accept failed: {}", e),
@@ -161,7 +165,7 @@ where
                     let _ = stream.set_nodelay(true);
 
                     if let Err(e) =
-                        send_msg(&mut stream, &ReadyPeerMessage(my_node_id.clone())).await
+                        send_msg(&mut stream, &FirstMessage::Peer(ReadyPeerMessage(my_node_id.clone()))).await
                     {
                         error!("[{}] Failed to send Ready to {}: {}", my_name, peer_name, e);
                         return;
@@ -189,7 +193,7 @@ where
     info!("[{}] All {} peers connected", my_name, streams.len());
 
     // Now split each stream into reader/writer tasks with channels
-    let (inbox_sender, inbox_receiver) = mpsc::channel::<(NodeId, PeerMessage<K, V>)>(256);
+    let (inbox_sender, inbox_receiver) = mpsc::channel::<(NodeId, PeerMessage<K, V>)>(2048);
     let mut senders = HashMap::new();
     // list of all nodes in the cluster
     let mut cluster: Vec<NodeId> = streams.keys().cloned().collect();
@@ -200,7 +204,7 @@ where
 
     for (peer_id, stream) in streams {
         let (read_half, write_half) = stream.into_split();
-        let (outbox_sender, outbox_receiver) = mpsc::channel::<PeerMessage<K, V>>(64);
+        let (outbox_sender, outbox_receiver) = mpsc::channel::<PeerMessage<K, V>>(512);
 
         // Reader task: recv from socket -> inbox
         let inbox_sender = inbox_sender.clone();
@@ -222,6 +226,7 @@ where
         },
         cluster,
         my_node_id,
+        client_receiver,
     ))
 }
 
@@ -261,7 +266,7 @@ fn node_to_index(name: &str) -> Option<usize> {
     NODES.iter().position(|&n| n == name)
 }
 
-fn get_connect_str(name: &str) -> String {
+pub fn get_connect_str(name: &str) -> String {
     format!("{name}.{DOMAIN}:{PORT}")
 }
 

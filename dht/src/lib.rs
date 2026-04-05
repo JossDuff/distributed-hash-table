@@ -9,15 +9,19 @@ use anyhow::Result;
 pub use config::Config;
 use db::StripedDb;
 use handlers::{handle_local_get, handle_local_write, handle_peer_prepare};
-pub use messages::{LocalMessage, PeerMessage};
+pub use messages::{
+    ClientHello, ClientMessage, ClientResponse, FirstMessage, LocalMessage, PeerMessage,
+    ReadyPeerMessage,
+};
 use net::{connect_all, Peers};
+pub use net::{get_connect_str, recv_msg, send_msg};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
     fmt::{self, Debug},
     hash::{Hash, Hasher},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -26,11 +30,11 @@ use tokio::sync::OwnedMutexGuard;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{debug, info};
 
-const CHANNEL_BUFFER_SIZE: usize = 64;
+const CHANNEL_BUFFER_SIZE: usize = 512;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(500);
 pub(crate) const VOTE_LEARN_TIMEOUT: Duration = Duration::from_millis(500);
-pub(crate) const PREPARE_LOCK_TIMEOUT: Duration = Duration::from_millis(2000);
+pub(crate) const PREPARE_LOCK_TIMEOUT: Duration = Duration::from_millis(500);
 pub(crate) const QUORUM_READ_TIMEOUT: Duration = Duration::from_millis(200);
 pub(crate) const STRIPE_LOCK_TIMEOUT: Duration = Duration::from_millis(50);
 
@@ -88,8 +92,8 @@ pub(crate) struct Shared<K: Clone, V: Clone> {
     // Crash detection
     pub(crate) alive_nodes: Arc<Mutex<HashSet<NodeId>>>,
     pub(crate) last_pong: Arc<Mutex<HashMap<NodeId, Instant>>>,
-    pub(crate) done_count: AtomicUsize,
-    // signaled when done_count reaches cluster.len()
+    pub(crate) done_nodes: Arc<Mutex<HashSet<NodeId>>>,
+    // signaled when done_nodes.len() reaches cluster.len()
     pub(crate) shutdown: Notify,
 }
 
@@ -108,18 +112,25 @@ where
         + Copy,
     V: Send + Sync + 'static + Debug + Serialize + for<'de> Deserialize<'de> + Clone,
 {
-    /// Mark a node as done (finished tests or crashed).
-    /// Removes from alive_nodes and increments done_count.
-    /// Prevents double-counting (a node that crashes AND sends Done).
+    /// Mark a node as done (finished tests). Node stays alive to serve replicas.
+    /// Prevents double-counting via done_nodes set.
     pub(crate) async fn mark_node_done(&self, node: &NodeId) {
-        let mut alive = self.alive_nodes.lock().await;
-        if alive.remove(node) {
-            drop(alive);
-            let count = self.done_count.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut done = self.done_nodes.lock().await;
+        if done.insert(node.clone()) {
+            let count = done.len();
+            drop(done);
             if count >= self.cluster.len() {
                 self.shutdown.notify_waiters();
             }
         }
+    }
+
+    /// Mark a node as dead (crashed). Removes from alive_nodes AND counts as done.
+    pub(crate) async fn mark_node_dead(&self, node: &NodeId) {
+        let mut alive = self.alive_nodes.lock().await;
+        alive.remove(node);
+        drop(alive);
+        self.mark_node_done(node).await;
     }
 
     /// Acceptor quorum: majority of ALL nodes in cluster.
@@ -177,8 +188,10 @@ where
     K: Clone,
 {
     shared: Arc<Shared<K, V>>,
+    local_sender: mpsc::Sender<LocalMessage<K, V>>,
     local_inbox: mpsc::Receiver<LocalMessage<K, V>>,
     peer_inbox: mpsc::Receiver<(NodeId, PeerMessage<K, V>)>,
+    client_rx: mpsc::Receiver<tokio::net::TcpStream>,
 }
 
 impl<K, V> Node<K, V>
@@ -199,7 +212,7 @@ where
     pub async fn new(
         config: Config,
         net_handle: &tokio::runtime::Handle,
-    ) -> Result<(Self, mpsc::Sender<LocalMessage<K, V>>)> {
+    ) -> Result<Self> {
         let db = StripedDb::new(config.stripes);
         let pending_prepares: Arc<Mutex<HashMap<u64, PendingTx<K, V>>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -210,11 +223,11 @@ where
         let tx_trackers: Arc<Mutex<HashMap<u64, Arc<TxVoteTracker>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        // this is a barrier
-        let (peers, cluster, my_node_id): (Peers<K, V>, Vec<NodeId>, NodeId) =
+        // this is a barrier — also returns client connection receiver
+        let (peers, cluster, my_node_id, client_rx): (Peers<K, V>, Vec<NodeId>, NodeId, _) =
             connect_all::<K, V>(&config.name, &config.connections, net_handle).await?;
 
-        // for sending/ receiving messages from the test harness
+        // for sending/ receiving messages from client handlers
         let (local_sender, local_inbox) = mpsc::channel(CHANNEL_BUFFER_SIZE);
 
         // Destructure Peers so we can give the inbox to one task and
@@ -245,30 +258,40 @@ where
             tx_trackers,
             alive_nodes: Arc::new(Mutex::new(alive_nodes)),
             last_pong: Arc::new(Mutex::new(last_pong)),
-            done_count: AtomicUsize::new(0),
+            done_nodes: Arc::new(Mutex::new(HashSet::new())),
             shutdown: Notify::new(),
         });
 
-        Ok((
-            Self {
-                shared,
-                local_inbox,
-                peer_inbox,
-            },
+        Ok(Self {
+            shared,
             local_sender,
-        ))
+            local_inbox,
+            peer_inbox,
+            client_rx,
+        })
     }
 
-    // Split into two independent tasks, each with its own receiver.
+    // Split into independent tasks, each with its own receiver.
     pub async fn run(self) -> Result<()> {
         let shared_local = self.shared.clone();
         let shared_peer = self.shared.clone();
         let shared_heartbeat = self.shared.clone();
         let shutdown = self.shared.clone();
 
+        let local_sender = self.local_sender;
+        let mut client_rx = self.client_rx;
+
         let local_handle = tokio::spawn(run_local_loop(shared_local, self.local_inbox));
         let peer_handle = tokio::spawn(run_peer_loop(shared_peer, self.peer_inbox));
         let heartbeat_handle = tokio::spawn(spawn_heartbeat_task(shared_heartbeat));
+
+        // Accept client connections and spawn handlers
+        let client_handle = tokio::spawn(async move {
+            while let Some(stream) = client_rx.recv().await {
+                let sender = local_sender.clone();
+                tokio::spawn(run_client_handler(stream, sender));
+            }
+        });
 
         // Wait for shutdown signal (done_count >= cluster.len())
         shutdown.shutdown.notified().await;
@@ -278,13 +301,103 @@ where
         local_handle.abort();
         peer_handle.abort();
         heartbeat_handle.abort();
+        client_handle.abort();
 
         // Swallow JoinErrors from the aborts
         let _ = local_handle.await;
         let _ = peer_handle.await;
         let _ = heartbeat_handle.await;
+        let _ = client_handle.await;
 
         Ok(())
+    }
+}
+
+/// Handles a single client TCP connection: reads ClientMessage, translates to
+/// LocalMessage, awaits the response, and writes ClientResponse back.
+async fn run_client_handler<K, V>(
+    stream: tokio::net::TcpStream,
+    local_sender: mpsc::Sender<LocalMessage<K, V>>,
+) where
+    K: Send
+        + Sync
+        + 'static
+        + Debug
+        + Serialize
+        + for<'de> Deserialize<'de>
+        + Hash
+        + Eq
+        + PartialEq
+        + Clone
+        + Copy,
+    V: Send + Sync + 'static + Debug + Serialize + for<'de> Deserialize<'de> + Clone,
+{
+    let (mut read_half, write_half) = stream.into_split();
+    let write_half = Arc::new(Mutex::new(write_half));
+
+    loop {
+        let msg: ClientMessage<K, V> = match net::recv_msg(&mut read_half).await {
+            Ok(m) => m,
+            Err(_) => {
+                info!("Client disconnected");
+                break;
+            }
+        };
+
+        match msg {
+            ClientMessage::Get { key, req_id } => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = local_sender
+                    .send(LocalMessage::Get {
+                        key,
+                        response_sender: tx,
+                    })
+                    .await;
+                let wh = write_half.clone();
+                tokio::spawn(async move {
+                    let val = rx.await.unwrap_or(None);
+                    let resp: ClientResponse<V> = ClientResponse::GetResult { val, req_id };
+                    let mut w = wh.lock().await;
+                    let _ = net::send_msg(&mut *w, &resp).await;
+                });
+            }
+            ClientMessage::Put { pair, req_id } => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = local_sender
+                    .send(LocalMessage::Put {
+                        pair,
+                        response_sender: tx,
+                    })
+                    .await;
+                let wh = write_half.clone();
+                tokio::spawn(async move {
+                    let success = rx.await.unwrap_or(false);
+                    let resp: ClientResponse<V> = ClientResponse::WriteResult { success, req_id };
+                    let mut w = wh.lock().await;
+                    let _ = net::send_msg(&mut *w, &resp).await;
+                });
+            }
+            ClientMessage::TriPut { pairs, req_id } => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = local_sender
+                    .send(LocalMessage::TriPut {
+                        pairs,
+                        response_sender: tx,
+                    })
+                    .await;
+                let wh = write_half.clone();
+                tokio::spawn(async move {
+                    let success = rx.await.unwrap_or(false);
+                    let resp: ClientResponse<V> = ClientResponse::WriteResult { success, req_id };
+                    let mut w = wh.lock().await;
+                    let _ = net::send_msg(&mut *w, &resp).await;
+                });
+            }
+            ClientMessage::Done => {
+                let _ = local_sender.send(LocalMessage::Done).await;
+                break;
+            }
+        }
     }
 }
 
@@ -337,7 +450,7 @@ where
         }
         for node in &dead {
             info!("Heartbeat: {} timed out, marking as dead", node);
-            s.mark_node_done(node).await;
+            s.mark_node_dead(node).await;
         }
 
         // Periodic diagnostic: every 10 heartbeats (1 second)
@@ -487,13 +600,14 @@ where
                         rm_id, vote, tx_id
                     );
                     let my_node_id = s.my_node_id.clone();
+                    let alive = s.alive_nodes.lock().await.clone();
                     for (node_id, sender) in s.senders.iter() {
-                        if *node_id != my_node_id {
-                            let _ = sender.try_send(PeerMessage::Accepted {
+                        if *node_id != my_node_id && alive.contains(node_id) {
+                            let _ = sender.send(PeerMessage::Accepted {
                                 tx_id,
                                 rm_id: rm_id.clone(),
                                 vote,
-                            });
+                            }).await;
                         }
                     }
 

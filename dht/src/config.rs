@@ -12,14 +12,6 @@ pub struct Config {
     #[arg(short, long, required = true, value_delimiter = ',')]
     pub connections: Vec<String>,
 
-    /// Number of keys to test on
-    #[arg(short, long, default_value = "1000000")]
-    pub num_keys: usize,
-
-    /// Range of keys
-    #[arg(short, long, default_value = "1000")]
-    pub key_range: u64,
-
     /// how many nodes hold each key
     #[arg(short, long, default_value = "2")]
     pub repication_degree: usize,

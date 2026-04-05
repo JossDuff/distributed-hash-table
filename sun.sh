@@ -37,7 +37,7 @@ Commands:
   list                              List all nodes with their current CPU load
   run -n <num> [-- args...]         Run 'target/release/dht' on N least-loaded nodes
   exec -n <num> -- <command>        Run arbitrary command on N least-loaded nodes
-  kill [name]                       Kill processes on all nodes (default: 'dht')
+  cleanup                            Kill dht and dht-client on all nodes
 
 Options:
   -n <num>      Number of nodes to use (required for 'run' and 'exec')
@@ -47,6 +47,7 @@ Options:
   -s <num>      Number of locked sections in the database (default: 256)
   -d <dir>      Project directory (default: current directory)
   -v            Enable debug logging (RUST_LOG=debug instead of info)
+  --kill <sec>  Kill a random node after <sec> seconds (fault tolerance test)
   -h, --help    Show this help
 
 Examples:
@@ -57,11 +58,11 @@ Examples:
   sun.sh run -n 3 -k 100000 -r 1000
   sun.sh run -n 3 -R 3                 Run with replication degree 3
   sun.sh run -n 3 -s 512               Run with 512 stripes
+  sun.sh run -n 4 -R 3 --kill 10       Kill a random node after 10s
   sun.sh run -n 3 -- --extra-flag
   sun.sh exec -n 3 -- hostname
   sun.sh exec -n 5 -- "cd ~/dev/project && ./my_script.sh"
-  sun.sh kill                          Kill 'dht' on all nodes
-  sun.sh kill myapp                    Kill 'myapp' on all nodes
+  sun.sh cleanup                       Kill dht and dht-client on all nodes
 
 Logs are saved to: logs/<node>.log
 
@@ -111,19 +112,18 @@ get_sorted_nodes() {
     rm -f "$tmp_file"
 }
 
-# Kill my dht binary running on all machines
-cmd_kill() {
-    local binary_name="${1:-dht}"
-
-    echo -e "${GREEN}=== Killing '$binary_name' on all nodes ===${NC}"
+# Kill both dht and dht-client on all machines
+cmd_cleanup() {
+    echo -e "${GREEN}=== Killing dht and dht-client on all nodes ===${NC}"
     echo ""
 
     for node in "${ALL_NODES[@]}"; do
         local host="${node}.${DOMAIN}"
         result=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 -o BatchMode=yes \
-            "${USERNAME}@${host}" "pkill -u $USERNAME $binary_name && echo 'killed' || echo 'none'" 2>/dev/null)
-        if [[ "$result" == "killed" ]]; then
-            echo -e "${YELLOW}[$node]${NC} killed $binary_name"
+            "${USERNAME}@${host}" "pkill -u $USERNAME -x dht 2>/dev/null && echo -n 'node '; pkill -u $USERNAME -x dht-client 2>/dev/null && echo -n 'client '; echo" 2>/dev/null)
+        result=$(echo "$result" | xargs)
+        if [[ -n "$result" ]]; then
+            echo -e "${YELLOW}[$node]${NC} killed: $result"
         fi
     done &
     wait
@@ -295,14 +295,15 @@ cmd_run() {
     local replication_degree="$5"
     local stripes="$6"
     local rust_log="$7"
-    shift 7
+    local kill_after="$8"
+    shift 8
     local program_args="$*"
 
     echo -e "${GREEN}=== Running on Cluster ===${NC}"
     echo ""
 
-    echo -e "${CYAN}Building project to populate cargo cache...${NC}"
-    (cd "$project_dir" && cargo build --release --quiet)
+    echo -e "${CYAN}Building project...${NC}"
+    (cd "$project_dir" && cargo build --release --quiet --target-dir $TARGET_DIR)
     echo -e "${GREEN}Build complete${NC}"
     echo ""
 
@@ -323,6 +324,9 @@ cmd_run() {
     if [[ -n "$stripes" ]]; then
         echo -e "Stripes: ${BLUE}$stripes${NC}"
     fi
+    if [[ -n "$kill_after" ]]; then
+        echo -e "Kill after: ${BLUE}${kill_after}s${NC}"
+    fi
     if [[ -n "$program_args" ]]; then
         echo -e "Extra args: ${BLUE}$program_args${NC}"
     fi
@@ -335,10 +339,15 @@ cmd_run() {
     echo ""
 
     declare -A PIDS
+    KILL_PID=""
 
     cleanup() {
         echo ""
         echo -e "${RED}Caught interrupt, stopping all nodes...${NC}"
+
+        if [[ -n "$KILL_PID" ]]; then
+            kill "$KILL_PID" 2>/dev/null
+        fi
 
         for node in "${!PIDS[@]}"; do
             kill "${PIDS[$node]}" 2>/dev/null && echo -e "${YELLOW}[$node]${NC} stopped"
@@ -347,7 +356,7 @@ cmd_run() {
         for node in "${nodes[@]}"; do
             local host="${node}.${DOMAIN}"
             ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
-                "${USERNAME}@${host}" "pkill -u $USERNAME dht" 2>/dev/null
+                "${USERNAME}@${host}" "pkill -u $USERNAME -x dht; pkill -u $USERNAME -x dht-client" 2>/dev/null
         done
 
         echo ""
@@ -360,40 +369,68 @@ cmd_run() {
 
     for node in "${nodes[@]}"; do
         local host="${node}.${DOMAIN}"
-        local log_file="$LOG_DIR/${node}.log"
+        local node_log="$LOG_DIR/${node}-node.log"
+        local client_log="$LOG_DIR/${node}-client.log"
         local connections
         connections=$(get_connections "$node" "${nodes[@]}")
 
-        local cmd="cd $project_dir && cargo build --release --quiet --target-dir $TARGET_DIR && export RUST_LOG=$rust_log && $TARGET_DIR/release/dht --name $node --connections $connections"
-        if [[ -n "$num_keys" ]]; then
-            cmd="$cmd --num-keys $num_keys"
-        fi
-        if [[ -n "$key_range" ]]; then
-            cmd="$cmd --key-range $key_range"
-        fi
+        # Build the node command
+        local node_cmd="$TARGET_DIR/release/dht --name $node --connections $connections"
         if [[ -n "$replication_degree" ]]; then
-            cmd="$cmd --repication-degree $replication_degree"
+            node_cmd="$node_cmd --repication-degree $replication_degree"
         fi
         if [[ -n "$stripes" ]]; then
-            cmd="$cmd --stripes $stripes"
+            node_cmd="$node_cmd --stripes $stripes"
         fi
         if [[ -n "$program_args" ]]; then
-            cmd="$cmd $program_args"
+            node_cmd="$node_cmd $program_args"
         fi
 
-        echo -e "${YELLOW}[$node]${NC} starting (connects to: $connections)"
+        # Build the client command
+        local client_cmd="$TARGET_DIR/release/dht-client --name $node --connections $connections"
+        if [[ -n "$num_keys" ]]; then
+            client_cmd="$client_cmd --num-keys $num_keys"
+        fi
+        if [[ -n "$key_range" ]]; then
+            client_cmd="$client_cmd --key-range $key_range"
+        fi
 
+        echo -e "${YELLOW}[$node]${NC} starting node + client (connects to: $connections)"
+
+        # Node SSH: build to scratch, then run node
         ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-            "${USERNAME}@${host}" "$cmd" \
-            >"$log_file" 2>&1 &
+            "${USERNAME}@${host}" \
+            "cd $project_dir && cargo build --release --quiet --target-dir $TARGET_DIR && export RUST_LOG=$rust_log && exec $node_cmd" \
+            >"$node_log" 2>&1 &
+        PIDS["${node}-node"]=$!
 
-        PIDS[$node]=$!
+        # Client SSH: build (waits for cargo lock), then run client
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+            "${USERNAME}@${host}" \
+            "cd $project_dir && cargo build --release --quiet --target-dir $TARGET_DIR && export RUST_LOG=$rust_log && sleep 2 && exec $client_cmd" \
+            >"$client_log" 2>&1 &
+        PIDS["${node}-client"]=$!
     done
 
     echo ""
     echo -e "${GREEN}All nodes started. Waiting for completion...${NC}"
     echo -e "${YELLOW}Press Ctrl+C to stop all nodes${NC}"
     echo ""
+
+    # Kill timer: after specified seconds, kill a random node's dht process
+    if [[ -n "$kill_after" ]]; then
+        kill_index=$(( RANDOM % ${#nodes[@]} ))
+        kill_node="${nodes[$kill_index]}"
+        echo -e "${RED}[KILL] Will kill node '${kill_node}' after ${kill_after}s${NC}"
+        (
+            sleep "$kill_after"
+            echo -e "${RED}[KILL] Killing node '${kill_node}' now...${NC}"
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
+                "${USERNAME}@${kill_node}.${DOMAIN}" "pkill -u $USERNAME -x dht" 2>/dev/null
+            echo -e "${RED}[KILL] Node '${kill_node}' has been killed${NC}"
+        ) &
+        KILL_PID=$!
+    fi
 
     failed=0
     for node in "${!PIDS[@]}"; do
@@ -404,6 +441,12 @@ cmd_run() {
             ((failed++))
         fi
     done
+
+    # Clean up kill timer if still running
+    if [[ -n "$KILL_PID" ]]; then
+        kill "$KILL_PID" 2>/dev/null
+        wait "$KILL_PID" 2>/dev/null
+    fi
 
     echo ""
     echo -e "${GREEN}=== Run Complete ===${NC}"
@@ -454,6 +497,7 @@ KEY_RANGE=""
 REPLICATION_DEGREE=""
 STRIPES=""
 RUST_LOG="info"
+KILL_AFTER=""
 EXTRA_ARGS=""
 
 while [[ $# -gt 0 ]]; do
@@ -486,6 +530,10 @@ while [[ $# -gt 0 ]]; do
         RUST_LOG="debug"
         shift
         ;;
+    --kill)
+        KILL_AFTER="$2"
+        shift 2
+        ;;
     -h | --help)
         usage
         ;;
@@ -515,7 +563,7 @@ run)
         echo -e "${RED}Error: Number of nodes must be a positive integer${NC}"
         exit 1
     fi
-    cmd_run "$NUM_NODES" "$PROJECT_DIR" "$NUM_KEYS" "$KEY_RANGE" "$REPLICATION_DEGREE" "$STRIPES" "$RUST_LOG" $EXTRA_ARGS
+    cmd_run "$NUM_NODES" "$PROJECT_DIR" "$NUM_KEYS" "$KEY_RANGE" "$REPLICATION_DEGREE" "$STRIPES" "$RUST_LOG" "$KILL_AFTER" $EXTRA_ARGS
     ;;
 exec)
     if [[ -z "$NUM_NODES" ]]; then
@@ -534,8 +582,8 @@ exec)
     fi
     cmd_exec "$NUM_NODES" $EXTRA_ARGS
     ;;
-kill)
-    cmd_kill "${EXTRA_ARGS:-dht}"
+cleanup)
+    cmd_cleanup
     ;;
 -h | --help)
     usage
