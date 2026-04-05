@@ -66,8 +66,8 @@ pub(crate) struct PendingTx<K: Clone, V: Clone> {
     pub(crate) version: u64,
 }
 
-/// Tracks Accepted messages for a transaction so every participant can
-/// independently determine the commit/abort outcome (Faster Paxos-Commit).
+// Tracks Accepted messages for a transaction so every participant can
+// independently determine the commit/abort outcome (Faster Paxos-Commit).
 pub(crate) struct TxVoteTracker {
     // For each RM: (acceptors that confirmed Prepared, acceptors that confirmed Aborted)
     pub(crate) rm_votes: Mutex<HashMap<NodeId, (HashSet<NodeId>, HashSet<NodeId>)>>,
@@ -112,8 +112,8 @@ where
         + Copy,
     V: Send + Sync + 'static + Debug + Serialize + for<'de> Deserialize<'de> + Clone,
 {
-    /// Mark a node as done (finished tests). Node stays alive to serve replicas.
-    /// Prevents double-counting via done_nodes set.
+    // Mark a node as done (finished tests). Node stays alive to serve replicas.
+    // Prevents double-counting via done_nodes set.
     pub(crate) async fn mark_node_done(&self, node: &NodeId) {
         let mut done = self.done_nodes.lock().await;
         if done.insert(node.clone()) {
@@ -125,7 +125,7 @@ where
         }
     }
 
-    /// Mark a node as dead (crashed). Removes from alive_nodes AND counts as done.
+    // Mark a node as dead (crashed). Removes from alive_nodes AND counts as done.
     pub(crate) async fn mark_node_dead(&self, node: &NodeId) {
         let mut alive = self.alive_nodes.lock().await;
         alive.remove(node);
@@ -133,7 +133,7 @@ where
         self.mark_node_done(node).await;
     }
 
-    /// Acceptor quorum: majority of ALL nodes in cluster.
+    // Acceptor quorum: majority of ALL nodes in cluster.
     pub(crate) fn acceptor_quorum(&self) -> usize {
         self.cluster.len() / 2 + 1
     }
@@ -145,22 +145,22 @@ where
             .collect()
     }
 
-    /// Assign a new version for a write operation (Lamport clock).
+    // Assign a new version for a write operation (Lamport clock).
     pub(crate) fn next_version(&self) -> u64 {
         self.version_counter.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// Update local Lamport clock on receiving a remote version.
+    // Update local Lamport clock on receiving a remote version.
     pub(crate) fn observe_version(&self, remote_version: u64) {
         self.version_counter.fetch_max(remote_version, Ordering::SeqCst);
     }
 
-    /// Quorum size for this replication degree (strict majority).
+    // Quorum size for this replication degree (strict majority).
     pub(crate) fn quorum_size(&self) -> usize {
         self.replication_degree / 2 + 1
     }
 
-    /// Get alive replicas for a key.
+    // Get alive replicas for a key.
     pub(crate) async fn get_alive_replicas(&self, key: &K) -> Vec<NodeId> {
         let all_replicas = self.get_key_replicas(key);
         let alive = self.alive_nodes.lock().await;
@@ -313,8 +313,8 @@ where
     }
 }
 
-/// Handles a single client TCP connection: reads ClientMessage, translates to
-/// LocalMessage, awaits the response, and writes ClientResponse back.
+// Handles a single client TCP connection: reads ClientMessage, translates to
+// LocalMessage, awaits the response, and writes ClientResponse back.
 async fn run_client_handler<K, V>(
     stream: tokio::net::TcpStream,
     local_sender: mpsc::Sender<LocalMessage<K, V>>,

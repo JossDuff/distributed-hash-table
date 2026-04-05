@@ -22,19 +22,19 @@ const MAX_RETRIES: usize = 10;
 
 #[derive(Parser, Debug)]
 struct ClientConfig {
-    /// Name of this client's co-located node
+    // Name of this client's co-located node
     #[arg(short, long, required = true)]
     name: String,
 
-    /// Names of all OTHER nodes in the cluster (for failover)
+    // Names of all OTHER nodes in the cluster (for failover)
     #[arg(short, long, required = true, value_delimiter = ',')]
     connections: Vec<String>,
 
-    /// Number of operations to run
+    // Number of operations to run
     #[arg(short = 'k', long, default_value = "1000000")]
     num_keys: usize,
 
-    /// Range of keys
+    // Range of keys
     #[arg(short, long, default_value = "1000")]
     key_range: u64,
 }
@@ -52,14 +52,15 @@ struct Snapshot {
     successful_txns: u64,
 }
 
-/// Pending response map: req_id -> oneshot sender for the response
+// Pending response map: req_id -> oneshot sender for the response
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<ClientResponse<u8>>>>>;
 
-/// Shared connection state
+// Shared connection state for node connections
 struct ConnectionState {
     writers: Vec<Arc<Mutex<OwnedWriteHalf>>>,
     pending: PendingMap,
     disconnect: Arc<Notify>,
+    // set to true if the co-located node dies
     failed_over: bool,
 }
 
@@ -122,16 +123,16 @@ async fn run() -> Result<()> {
     let start = Instant::now();
 
     // Interval metrics collection
+    // Every COLLECT_INTERVAL ms awake this task and count how many operations have occured and the
+    // average latency of those operations
     let metrics = Arc::new(IntervalMetrics {
         latency_sum_us: AtomicU64::new(0),
         op_count: AtomicU64::new(0),
         success_count: AtomicU64::new(0),
         max_retries_hit: AtomicU64::new(0),
     });
-    let snapshots: Arc<Mutex<Vec<Snapshot>>> = Arc::new(Mutex::new(Vec::new()));
 
     let collector_metrics = metrics.clone();
-    let collector_snapshots = snapshots.clone();
     let collector_start = start;
     let collector_handle = tokio::spawn(async move {
         loop {
@@ -150,16 +151,14 @@ async fn run() -> Result<()> {
                 "{:.1}s | txns: {} | ops/sec: {:.0} | avg_latency: {:.3}ms",
                 elapsed_secs, success, ops_sec, avg_lat
             );
-            collector_snapshots.lock().await.push(Snapshot {
-                elapsed_secs,
-                avg_latency_ms: avg_lat,
-                successful_txns: success,
-            });
         }
     });
 
+    // permits for in-flight transactions
     let semaphore = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
+    // for request ids
     let req_counter = Arc::new(AtomicU64::new(0));
+    // if in failover mode, for getting the next node to send a request to
     let round_robin = Arc::new(AtomicU64::new(0));
 
     let mut handles = Vec::with_capacity(test_data.len());
@@ -175,12 +174,14 @@ async fn run() -> Result<()> {
         let home_name = config.name.clone();
 
         handles.push(tokio::spawn(async move {
+            // wait until we can send this operation
             let _permit = sem.acquire().await.unwrap();
+
             let req_start = Instant::now();
             let success = match operation {
                 Operation::Get { key } => {
                     let req_id = req_ctr.fetch_add(1, Ordering::Relaxed);
-                    send_and_receive_get(key, req_id, &conn, &rr).await
+                    send_and_receive_get(key, req_id, &conn, &rr, &all_connections, &home_name).await
                 }
                 Operation::Put { pair } => {
                     let mut attempts = 0;
@@ -268,26 +269,9 @@ async fn run() -> Result<()> {
     }
     let elapsed = start.elapsed();
 
-    // Stop collector and print interval data
+    // Stop collector
     collector_handle.abort();
     let _ = collector_handle.await;
-
-    let snaps = snapshots.lock().await;
-    info!(
-        "=== Interval Metrics ({}s intervals) ===",
-        COLLECT_INTERVAL.as_secs()
-    );
-    info!(
-        "{:<12} {:>20} {:>20}",
-        "Time(s)", "Successful Txns", "Avg Latency(ms)"
-    );
-    for snap in snaps.iter() {
-        info!(
-            "{:<12.1} {:>20} {:>20.3}",
-            snap.elapsed_secs, snap.successful_txns, snap.avg_latency_ms
-        );
-    }
-    drop(snaps);
 
     // Send Done to home node (if still connected, i.e., not in failover mode)
     done.store(true, Ordering::Relaxed);
@@ -301,6 +285,7 @@ async fn run() -> Result<()> {
         }
     }
 
+    // print summary info
     info!("Completed {} operations in {:?}", config.num_keys, elapsed);
     info!(
         "Throughput: {:.2} ops/sec",
@@ -322,7 +307,7 @@ async fn run() -> Result<()> {
     std::process::exit(0);
 }
 
-/// Connect to a node, returning the writer and spawning a reader task.
+// Connect to a node, returning the writer and spawning a reader task.
 async fn connect_to_node(
     node_name: &str,
     client_name: &str,
@@ -361,7 +346,7 @@ async fn connect_to_node(
     Ok((writer, reader_handle))
 }
 
-/// Reader task: reads ClientResponse from a node, dispatches to pending oneshot senders.
+// Reader task: reads ClientResponse from a node, dispatches to pending oneshot senders.
 async fn client_reader_task(
     node_name: String,
     mut read_half: OwnedReadHalf,
@@ -399,7 +384,7 @@ async fn client_reader_task(
     }
 }
 
-/// Perform failover: connect to all surviving nodes, drain pending requests.
+// Perform failover: connect to all surviving nodes, drain pending requests.
 async fn failover(
     conn_state: &Arc<Mutex<ConnectionState>>,
     connections: &[String],
@@ -461,12 +446,14 @@ async fn failover(
     state.failed_over = true;
 }
 
-/// Send a Get and receive the response.
+// Send a Get and receive the response.
 async fn send_and_receive_get(
     key: u64,
     req_id: u64,
     conn_state: &Arc<Mutex<ConnectionState>>,
     round_robin: &AtomicU64,
+    all_connections: &[String],
+    home_name: &str,
 ) -> bool {
     let (tx, rx) = oneshot::channel();
 
@@ -474,6 +461,8 @@ async fn send_and_receive_get(
     let (writer, pending, disconnect_notify) = {
         let state = conn_state.lock().await;
         if state.writers.is_empty() {
+            drop(state);
+            failover(conn_state, all_connections, home_name).await;
             return false;
         }
         let idx = round_robin.fetch_add(1, Ordering::Relaxed) as usize % state.writers.len();
@@ -502,12 +491,13 @@ async fn send_and_receive_get(
         }
         _ = disconnect_notify.notified() => {
             pending.lock().await.remove(&req_id);
-            true
+            failover(conn_state, all_connections, home_name).await;
+            false
         }
     }
 }
 
-/// Send a write (Put or TriPut) and receive the response.
+// Send a write (Put or TriPut) and receive the response.
 async fn send_and_receive_write(
     msg: ClientMessage<u64, u8>,
     req_id: u64,

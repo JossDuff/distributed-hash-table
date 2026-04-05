@@ -1,22 +1,22 @@
 use clap::Parser;
 
-/// Simple program to greet a person
+// Simple program to greet a person
 #[derive(Parser, Debug)]
 #[command(version, about)]
 pub struct Config {
-    /// Name of this node
+    // Name of this node
     #[arg(short, long, required = true)]
     pub name: String,
 
-    /// Names of sunlab nodes to connect to
+    // Names of sunlab nodes to connect to
     #[arg(short, long, required = true, value_delimiter = ',')]
     pub connections: Vec<String>,
 
-    /// how many nodes hold each key
+    // how many nodes hold each key
     #[arg(short, long, default_value = "2")]
     pub repication_degree: usize,
 
-    /// How many locked sections in the database
+    // How many locked sections in the database
     #[arg(short, long, default_value = "256")]
     pub stripes: usize,
 }

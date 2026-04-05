@@ -14,7 +14,7 @@ use std::{
 use tokio::sync::{mpsc, oneshot, Mutex, Notify, OwnedMutexGuard};
 use tracing::debug;
 
-/// Quorum read: read from alive replicas, return highest-versioned value.
+// Quorum read: read from alive replicas, return highest-versioned value.
 pub(crate) async fn handle_local_get<K, V>(
     s: &Arc<Shared<K, V>>,
     key: K,
@@ -128,11 +128,11 @@ where
     Ok(())
 }
 
-/// Paxos-Commit write (unified handler for put and triput).
-///
-/// Creates TxVoteTracker inline (before spawning) so the peer loop can
-/// deliver Accepted messages immediately. Spawns a task for lock acquisition,
-/// voting, and outcome determination.
+// Paxos-Commit write (unified handler for put and triput).
+//
+// Creates TxVoteTracker inline (before spawning) so the peer loop can
+// deliver Accepted messages immediately. Spawns a task for lock acquisition,
+// voting, and outcome determination.
 pub(crate) async fn handle_local_write<K, V>(
     s: &Arc<Shared<K, V>>,
     pairs: Vec<KVPair<K, V>>,
@@ -385,11 +385,11 @@ pub(crate) async fn handle_local_write<K, V>(
     });
 }
 
-/// RM role: receive Prepare, create tracker (inline), then spawn
-/// lock acquisition + voting + self-determination task.
-///
-/// The tracker is created before spawning so that Accepted messages arriving
-/// in the peer loop (from the coordinator's Vote) find the tracker immediately.
+// RM role: receive Prepare, create tracker (inline), then spawn
+// lock acquisition + voting + self-determination task.
+//
+// The tracker is created before spawning so that Accepted messages arriving
+// in the peer loop (from the coordinator's Vote) find the tracker immediately.
 pub(crate) async fn handle_peer_prepare<K, V>(
     s: &Arc<Shared<K, V>>,
     from: NodeId,

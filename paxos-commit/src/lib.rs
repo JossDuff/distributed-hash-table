@@ -1,31 +1,31 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
-/// Acceptor quorum: majority of ALL nodes in the cluster.
-/// With N acceptors, tolerates floor((N-1)/2) crashes.
+// Acceptor quorum: majority of ALL nodes in the cluster.
+// With N acceptors, tolerates floor((N-1)/2) crashes.
 pub fn acceptor_quorum(cluster_size: usize) -> usize {
     cluster_size / 2 + 1
 }
 
-/// Replica quorum: majority of a key's replicas.
-/// With R replicas, need R/2+1 Prepared votes for a key's write to succeed.
+// Replica quorum: majority of a key's replicas.
+// With R replicas, need R/2+1 Prepared votes for a key's write to succeed.
 pub fn replica_quorum(replication_degree: usize) -> usize {
     replication_degree / 2 + 1
 }
 
-/// Status of an individual RM's vote as seen by a learner.
+// Status of an individual RM's vote as seen by a learner.
 enum VoteStatus {
-    /// acceptor_quorum acceptors confirmed Prepared
+    // acceptor_quorum acceptors confirmed Prepared
     LearnedPrepared,
-    /// acceptor_quorum acceptors confirmed Aborted
+    // acceptor_quorum acceptors confirmed Aborted
     LearnedAborted,
-    /// RM is dead and insufficient acceptors to ever learn the vote
+    // RM is dead and insufficient acceptors to ever learn the vote
     Unlearnable,
-    /// Not yet enough acceptors to learn, but still possible
+    // Not yet enough acceptors to learn, but still possible
     Pending,
 }
 
-/// Classify an RM's vote based on collected Accepted messages.
+// Classify an RM's vote based on collected Accepted messages.
 fn classify_rm_vote<N: Eq + Hash>(
     rm_votes: &HashMap<N, (HashSet<N>, HashSet<N>)>,
     rm: &N,
@@ -54,18 +54,18 @@ fn classify_rm_vote<N: Eq + Hash>(
     }
 }
 
-/// Evaluate the Paxos-Commit commit rule for a transaction.
-///
-/// For each key in the transaction, checks whether a quorum of its replicas
-/// voted Prepared (learned via acceptor quorum of Accepted messages).
-///
-/// Returns:
-/// - `Some(true)` — committed: every key has `rq` replicas with learned Prepared votes
-/// - `Some(false)` — aborted: some key can never reach `rq` Prepared votes
-/// - `None` — not yet determined: waiting for more Accepted messages
-///
-/// Dead RMs with insufficient Accepted messages are treated as Aborted (safe:
-/// an unlearned vote was never "chosen" in the Paxos sense).
+// Evaluate the Paxos-Commit commit rule for a transaction.
+//
+// For each key in the transaction, checks whether a quorum of its replicas
+// voted Prepared (learned via acceptor quorum of Accepted messages).
+//
+// Returns:
+// - `Some(true)` — committed: every key has `rq` replicas with learned Prepared votes
+// - `Some(false)` — aborted: some key can never reach `rq` Prepared votes
+// - `None` — not yet determined: waiting for more Accepted messages
+//
+// Dead RMs with insufficient Accepted messages are treated as Aborted (safe:
+// an unlearned vote was never "chosen" in the Paxos sense).
 pub fn evaluate_commit_rule<N: Eq + Hash + Clone>(
     key_replicas: &[Vec<N>],
     rm_votes: &HashMap<N, (HashSet<N>, HashSet<N>)>,
@@ -108,10 +108,10 @@ pub fn evaluate_commit_rule<N: Eq + Hash + Clone>(
     }
 }
 
-/// Pick the highest-versioned value from quorum read responses.
-///
-/// Filters out `None` responses (replicas that don't have the key),
-/// then selects the value with the highest version number.
+// Pick the highest-versioned value from quorum read responses.
+//
+// Filters out `None` responses (replicas that don't have the key),
+// then selects the value with the highest version number.
 pub fn select_best_read<V: Clone>(responses: &[(Option<V>, u64)]) -> Option<V> {
     responses
         .iter()

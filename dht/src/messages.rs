@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use tokio::sync::oneshot;
 
-/// Handshake sent by a peer node on connection.
+// Handshake sent by a peer node on connection.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReadyPeerMessage(pub NodeId);
 
@@ -75,13 +75,13 @@ where
 
 // === Client-Node Protocol (over TCP) ===
 
-/// Handshake sent by a client to identify itself (distinct from ReadyPeerMessage).
+// Handshake sent by a client to identify itself (distinct from ReadyPeerMessage).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClientHello {
     pub client_name: String,
 }
 
-/// Request from client to node.
+// Request from client to node.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientMessage<K, V>
 where
@@ -94,7 +94,7 @@ where
     Done,
 }
 
-/// Response from node back to client.
+// Response from node back to client.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientResponse<V>
 where
@@ -104,8 +104,8 @@ where
     WriteResult { success: bool, req_id: u64 },
 }
 
-/// First message on any inbound TCP connection.
-/// The listener deserializes this to decide peer vs client handling.
+// First message on any inbound TCP connection.
+// The listener deserializes this to decide peer vs client handling.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum FirstMessage {
     Peer(ReadyPeerMessage),
