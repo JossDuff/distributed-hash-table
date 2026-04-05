@@ -17,7 +17,7 @@ use tracing::{debug, error, info};
 const PUT_FREQUENCY: usize = 20;
 const TRI_PUT_FREQUENCY: usize = 20;
 const COLLECT_INTERVAL: Duration = Duration::from_millis(1000);
-const MAX_IN_FLIGHT: usize = 16;
+const MAX_IN_FLIGHT: usize = 8;
 const MAX_RETRIES: usize = 10;
 
 #[derive(Parser, Debug)]
