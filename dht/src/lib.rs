@@ -81,7 +81,7 @@ pub(crate) struct Shared<K: Clone, V: Clone> {
     pub(crate) my_node_id: NodeId,
     pub(crate) replication_degree: usize,
     pub(crate) db: StripedDb<K, V>,
-    // Lamport clock for write versioning
+    // for write versioning
     pub(crate) version_counter: AtomicU64,
     // Quorum read response collection
     pub(crate) awaiting_quorum_get: Arc<Mutex<HashMap<u64, mpsc::Sender<(Option<V>, u64)>>>>,
@@ -145,14 +145,15 @@ where
             .collect()
     }
 
-    // Assign a new version for a write operation (Lamport clock).
+    // Assign a new version for a write operation
     pub(crate) fn next_version(&self) -> u64 {
         self.version_counter.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    // Update local Lamport clock on receiving a remote version.
+    // Update local version on receiving a remote version.
     pub(crate) fn observe_version(&self, remote_version: u64) {
-        self.version_counter.fetch_max(remote_version, Ordering::SeqCst);
+        self.version_counter
+            .fetch_max(remote_version, Ordering::SeqCst);
     }
 
     // Quorum size for this replication degree (strict majority).
@@ -209,10 +210,7 @@ where
         + Copy,
     V: Send + Sync + 'static + Debug + Serialize + for<'de> Deserialize<'de> + Clone,
 {
-    pub async fn new(
-        config: Config,
-        net_handle: &tokio::runtime::Handle,
-    ) -> Result<Self> {
+    pub async fn new(config: Config, net_handle: &tokio::runtime::Handle) -> Result<Self> {
         let db = StripedDb::new(config.stripes);
         let pending_prepares: Arc<Mutex<HashMap<u64, PendingTx<K, V>>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -554,16 +552,26 @@ where
                         Some((v, ver)) => (Some(v), ver),
                         None => (None, 0),
                     };
-                    let resp: PeerMessage<K, V> =
-                        PeerMessage::QuorumGetResponse { val, version, req_id };
+                    let resp: PeerMessage<K, V> = PeerMessage::QuorumGetResponse {
+                        val,
+                        version,
+                        req_id,
+                    };
                     if let Some(sender) = senders.get(&from) {
                         let _ = sender.try_send(resp);
                     }
                 });
             }
 
-            PeerMessage::QuorumGetResponse { val, version, req_id } => {
-                debug!("QuorumGetResponse for req {} with version {}", req_id, version);
+            PeerMessage::QuorumGetResponse {
+                val,
+                version,
+                req_id,
+            } => {
+                debug!(
+                    "QuorumGetResponse for req {} with version {}",
+                    req_id, version
+                );
                 let tx = {
                     let awaiting = s.awaiting_quorum_get.lock().await;
                     awaiting.get(&req_id).cloned()
@@ -574,13 +582,20 @@ where
             }
 
             // === Paxos-Commit ===
-            PeerMessage::Prepare { pairs, tx_id, version } => {
+            PeerMessage::Prepare {
+                pairs,
+                tx_id,
+                version,
+            } => {
                 handle_peer_prepare(&s, from, pairs, tx_id, version).await;
             }
 
             // === Paxos-Commit: Acceptor Role ===
             PeerMessage::Vote { tx_id, rm_id, vote } => {
-                debug!("Vote from {} for rm {} in tx {}, vote={}", from, rm_id, tx_id, vote);
+                debug!(
+                    "Vote from {} for rm {} in tx {}, vote={}",
+                    from, rm_id, tx_id, vote
+                );
                 let s = s.clone();
                 tokio::spawn(async move {
                     // Acceptor: check if already accepted this (tx_id, rm_id)
@@ -588,7 +603,10 @@ where
                         let mut log = s.acceptor_log.lock().await;
                         let key = (tx_id, rm_id.clone());
                         if log.contains_key(&key) {
-                            debug!("Already accepted vote for tx {} rm {}, ignoring", tx_id, rm_id);
+                            debug!(
+                                "Already accepted vote for tx {} rm {}, ignoring",
+                                tx_id, rm_id
+                            );
                             return;
                         }
                         log.insert(key, vote);
@@ -603,11 +621,13 @@ where
                     let alive = s.alive_nodes.lock().await.clone();
                     for (node_id, sender) in s.senders.iter() {
                         if *node_id != my_node_id && alive.contains(node_id) {
-                            let _ = sender.send(PeerMessage::Accepted {
-                                tx_id,
-                                rm_id: rm_id.clone(),
-                                vote,
-                            }).await;
+                            let _ = sender
+                                .send(PeerMessage::Accepted {
+                                    tx_id,
+                                    rm_id: rm_id.clone(),
+                                    vote,
+                                })
+                                .await;
                         }
                     }
 
